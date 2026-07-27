@@ -115,146 +115,76 @@ fn save_to_path(path: &Path, speed: f32) -> Result<(), String> {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProcessorKind {
+enum ProcessorKind {
     Bypass,
     Signalsmith,
 }
 
-/// Stateful streaming pitch-preserving processor.
+#[cfg(test)]
+fn processor_kind(speed: f32) -> ProcessorKind {
+    if (speed - DEFAULT_PLAYBACK_SPEED).abs() <= UNITY_EPSILON {
+        ProcessorKind::Bypass
+    } else {
+        ProcessorKind::Signalsmith
+    }
+}
+
+/// Pitch-preserve one already-buffered Pocket chunk.
 ///
-/// Calls to [`Self::process`] preserve input order. The current Pocket path
-/// uses [`Self::process_complete_chunk`] because Pocket already hands the
-/// player one complete synthesis chunk; a future progressive synthesizer can
-/// feed deltas through `process` and pay only the one-time reported latency.
-pub struct PlaybackSpeedProcessor {
-    inner: Processor,
+/// The returned buffer has exactly `input.len() / speed` samples. Signalsmith
+/// starts a reset processor `input_latency` samples before the supplied audio
+/// and emits another `output_latency` samples of pre-roll. Both components are
+/// removed after draining, so the returned chunk retains its beginning and
+/// tail without buffering any later Pocket chunk.
+pub fn process_complete_chunk(
+    input: &[f32],
     speed: f32,
-    input_samples: usize,
-    output_samples: usize,
-    cancelled: bool,
-}
-
-enum Processor {
-    Bypass,
-    Signalsmith(ssstretch::Stretch),
-}
-
-impl PlaybackSpeedProcessor {
-    /// Select bypass at 1x or Signalsmith Stretch at a non-unity speed.
-    pub fn new(speed: f32, sample_rate: u32) -> Result<Self, String> {
-        validate_speed(speed)?;
-        let inner = if (speed - DEFAULT_PLAYBACK_SPEED).abs() <= UNITY_EPSILON {
-            Processor::Bypass
-        } else {
-            let mut stretch = ssstretch::Stretch::new();
-            stretch.preset_default(1, sample_rate as f32);
-            Processor::Signalsmith(stretch)
-        };
-        Ok(Self {
-            inner,
-            speed,
-            input_samples: 0,
-            output_samples: 0,
-            cancelled: false,
-        })
+    sample_rate: u32,
+) -> Result<Vec<f32>, String> {
+    validate_speed(speed)?;
+    if input.is_empty() || (speed - DEFAULT_PLAYBACK_SPEED).abs() <= UNITY_EPSILON {
+        return Ok(input.to_vec());
     }
 
-    #[cfg(test)]
-    fn kind(&self) -> ProcessorKind {
-        match self.inner {
-            Processor::Bypass => ProcessorKind::Bypass,
-            Processor::Signalsmith(_) => ProcessorKind::Signalsmith,
-        }
+    let expected = (input.len() as f64 / speed as f64).round() as usize;
+    let mut stretch = ssstretch::Stretch::new();
+    stretch.preset_default(1, sample_rate as f32);
+    let input_latency = stretch.input_latency().max(0) as usize;
+    let output_latency = stretch.output_latency().max(0) as usize;
+    let reset_pre_roll = (input_latency as f64 / speed as f64).ceil() as usize;
+
+    let inputs = [input.to_vec()];
+    let mut output = [Vec::with_capacity(expected)];
+    stretch.process_vec(
+        &inputs,
+        i32_len(input.len())?,
+        &mut output,
+        i32_len(expected)?,
+    );
+
+    let latency_input = [vec![0.0; input_latency]];
+    let mut latency_output = [Vec::with_capacity(reset_pre_roll)];
+    stretch.process_vec(
+        &latency_input,
+        i32_len(input_latency)?,
+        &mut latency_output,
+        i32_len(reset_pre_roll)?,
+    );
+    output[0].extend_from_slice(&latency_output[0]);
+
+    let mut flushed = [Vec::with_capacity(output_latency)];
+    stretch.flush_vec(&mut flushed, i32_len(output_latency)?);
+    output[0].extend_from_slice(&flushed[0]);
+
+    let start = reset_pre_roll.saturating_add(output_latency);
+    let end = start.saturating_add(expected);
+    if output[0].len() < end {
+        return Err(format!(
+            "time stretcher produced {} samples, need {end}",
+            output[0].len()
+        ));
     }
-
-    /// One-time output-side algorithmic latency in samples.
-    pub fn output_latency(&self) -> usize {
-        match &self.inner {
-            Processor::Bypass => 0,
-            Processor::Signalsmith(stretch) => stretch.output_latency().max(0) as usize,
-        }
-    }
-
-    /// Process a progressive input delta without reordering prior deltas.
-    pub fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, String> {
-        if input.is_empty() || self.cancelled {
-            return Ok(Vec::new());
-        }
-        match &mut self.inner {
-            Processor::Bypass => Ok(input.to_vec()),
-            Processor::Signalsmith(stretch) => {
-                self.input_samples = self.input_samples.saturating_add(input.len());
-                let target_output =
-                    (self.input_samples as f64 / self.speed as f64).round() as usize;
-                let output_len = target_output.saturating_sub(self.output_samples);
-                let input_len = i32_len(input.len())?;
-                let output_len_i32 = i32_len(output_len)?;
-                let inputs = [input.to_vec()];
-                let mut outputs = [Vec::with_capacity(output_len)];
-                stretch.process_vec(&inputs, input_len, &mut outputs, output_len_i32);
-                self.output_samples = target_output;
-                Ok(std::mem::take(&mut outputs[0]))
-            }
-        }
-    }
-
-    /// Process one already-buffered Pocket chunk and compensate DSP pre-roll.
-    ///
-    /// This returns exactly `input.len() / speed` samples and does not buffer
-    /// any later Pocket chunk or the remainder of the response.
-    pub fn process_complete_chunk(&mut self, input: &[f32]) -> Result<Vec<f32>, String> {
-        if matches!(self.inner, Processor::Bypass) {
-            return self.process(input);
-        }
-
-        let expected = (input.len() as f64 / self.speed as f64).round() as usize;
-        let latency = self.output_latency();
-        let mut output = self.process(input)?;
-        output.extend(self.drain()?);
-
-        let end = latency.saturating_add(expected);
-        if output.len() < end {
-            return Err(format!(
-                "time stretcher produced {} samples, need {end}",
-                output.len()
-            ));
-        }
-        Ok(output[latency..end].to_vec())
-    }
-
-    /// Discard all pending processor output after barge-in.
-    #[allow(dead_code)] // Used by progressive synthesis integrations; current Pocket chunks are atomic.
-    pub fn cancel(&mut self) {
-        self.cancelled = true;
-        if let Processor::Signalsmith(stretch) = &mut self.inner {
-            stretch.reset();
-        }
-    }
-
-    fn drain(&mut self) -> Result<Vec<f32>, String> {
-        if self.cancelled {
-            return Ok(Vec::new());
-        }
-        let Processor::Signalsmith(stretch) = &mut self.inner else {
-            return Ok(Vec::new());
-        };
-        let input_latency = stretch.input_latency().max(0) as usize;
-        let output_latency = stretch.output_latency().max(0) as usize;
-        let drain_output = (input_latency as f64 / self.speed as f64).ceil() as usize;
-
-        let inputs = [vec![0.0; input_latency]];
-        let mut processed = [Vec::with_capacity(drain_output)];
-        stretch.process_vec(
-            &inputs,
-            i32_len(input_latency)?,
-            &mut processed,
-            i32_len(drain_output)?,
-        );
-        let mut flushed = [Vec::with_capacity(output_latency)];
-        stretch.flush_vec(&mut flushed, i32_len(output_latency)?);
-        processed[0].extend_from_slice(&flushed[0]);
-        Ok(std::mem::take(&mut processed[0]))
-    }
+    Ok(output[0][start..end].to_vec())
 }
 
 /// Validate a generated-speech playback speed.
@@ -280,36 +210,30 @@ mod tests {
 
     #[test]
     fn selects_bypass_only_at_unity() {
-        assert_eq!(
-            PlaybackSpeedProcessor::new(1.0, SAMPLE_RATE)
-                .expect("bypass")
-                .kind(),
-            ProcessorKind::Bypass
-        );
-        assert_eq!(
-            PlaybackSpeedProcessor::new(1.25, SAMPLE_RATE)
-                .expect("stretcher")
-                .kind(),
-            ProcessorKind::Signalsmith
-        );
+        assert_eq!(processor_kind(1.0), ProcessorKind::Bypass);
+        assert_eq!(processor_kind(1.25), ProcessorKind::Signalsmith);
     }
 
     #[test]
-    fn chunked_processing_preserves_length_pitch_and_order() {
+    fn complete_processing_preserves_length_pitch_and_order() {
         let input: Vec<f32> = (0..24_000)
             .map(|sample| {
-                let frequency = if sample < 12_000 { 220.0 } else { 440.0 };
+                let frequency = if sample < 8_000 {
+                    220.0
+                } else if sample < 16_000 {
+                    440.0
+                } else {
+                    660.0
+                };
                 (2.0 * std::f32::consts::PI * frequency * sample as f32 / SAMPLE_RATE as f32).sin()
             })
             .collect();
-        let mut processor = PlaybackSpeedProcessor::new(1.25, SAMPLE_RATE).expect("processor");
-        let output = processor
-            .process_complete_chunk(&input)
-            .expect("complete output");
+        let output = process_complete_chunk(&input, 1.25, SAMPLE_RATE).expect("complete output");
 
         assert_eq!(output.len(), 19_200);
-        let first_frequency = zero_crossing_frequency(&output[2_000..7_000], SAMPLE_RATE);
-        let second_frequency = zero_crossing_frequency(&output[12_000..17_000], SAMPLE_RATE);
+        let first_frequency = zero_crossing_frequency(&output[1_500..5_000], SAMPLE_RATE);
+        let second_frequency = zero_crossing_frequency(&output[7_500..11_000], SAMPLE_RATE);
+        let third_frequency = zero_crossing_frequency(&output[14_000..18_000], SAMPLE_RATE);
         assert!(
             (first_frequency - 220.0).abs() < 8.0,
             "first segment measured {first_frequency} Hz"
@@ -318,21 +242,10 @@ mod tests {
             (second_frequency - 440.0).abs() <= 10.0,
             "second segment measured {second_frequency} Hz"
         );
-    }
-
-    #[test]
-    fn cancellation_discards_subsequent_chunks_and_tail() {
-        let mut processor = PlaybackSpeedProcessor::new(1.25, SAMPLE_RATE).expect("processor");
-        assert!(!processor
-            .process(&vec![0.25; 4_800])
-            .expect("first chunk")
-            .is_empty());
-        processor.cancel();
-        assert!(processor
-            .process(&vec![0.5; 4_800])
-            .expect("cancelled chunk")
-            .is_empty());
-        assert!(processor.drain().expect("cancelled tail").is_empty());
+        assert!(
+            (third_frequency - 660.0).abs() <= 12.0,
+            "third segment measured {third_frequency} Hz"
+        );
     }
 
     #[test]
@@ -343,10 +256,15 @@ mod tests {
                 (2.0 * std::f32::consts::PI * frequency * sample as f32 / SAMPLE_RATE as f32).sin()
             })
             .collect();
-        let mut processor = PlaybackSpeedProcessor::new(1.5, SAMPLE_RATE).expect("processor");
-        let output = processor
-            .process_complete_chunk(&input)
-            .expect("complete output");
+        let output = process_complete_chunk(&input, 1.5, SAMPLE_RATE).expect("complete output");
+        assert!(
+            root_mean_square(&output[..480]) > 0.2,
+            "full reset pre-roll was not removed"
+        );
+        assert!(
+            root_mean_square(&output[output.len() - 480..]) > 0.2,
+            "speech tail was truncated"
+        );
         let measured = zero_crossing_frequency(&output[2_000..], SAMPLE_RATE);
         assert!(
             (measured - frequency).abs() < 3.0,
@@ -356,8 +274,9 @@ mod tests {
 
     #[test]
     fn non_unity_latency_stays_below_75_ms() {
-        let processor = PlaybackSpeedProcessor::new(1.25, SAMPLE_RATE).expect("processor");
-        let latency_ms = processor.output_latency() as f64 * 1_000.0 / SAMPLE_RATE as f64;
+        let mut stretch = ssstretch::Stretch::new();
+        stretch.preset_default(1, SAMPLE_RATE as f32);
+        let latency_ms = stretch.output_latency().max(0) as f64 * 1_000.0 / SAMPLE_RATE as f64;
         assert!(latency_ms <= 75.0, "algorithmic latency was {latency_ms}ms");
     }
 
@@ -378,5 +297,9 @@ mod tests {
             .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
             .count();
         crossings as f32 * sample_rate as f32 / samples.len() as f32
+    }
+
+    fn root_mean_square(samples: &[f32]) -> f32 {
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
     }
 }
