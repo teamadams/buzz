@@ -6,20 +6,30 @@
 //! embedded in installation-global settings or future agent identity without a
 //! schema change. Availability is intentionally client-local.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use crate::{app_state::AppState, managed_agents::storage::atomic_write_json_restricted};
 
-use super::{models, pocket::DEFAULT_VOICE, HuddlePhase};
+use super::{models, pocket::DEFAULT_VOICE, HuddlePhase, HuddleState};
 
 const SETTINGS_FILE: &str = "tts-settings.json";
 const CURRENT_VERSION: u32 = 1;
+const VOICE_CHANGE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 pub const POCKET_BACKEND_ID: &str = "pocket";
 pub const MARY_VOICE_KEY: &str = "pocket:mary";
 pub const MARIUS_VOICE_KEY: &str = "pocket:marius";
+
+type VoiceChangeWait = (
+    Arc<super::tts::TtsPipeline>,
+    tokio::sync::oneshot::Receiver<()>,
+);
 
 const VOICE_AVAILABILITY_BUNDLED: &str = "bundled";
 const VOICE_AVAILABILITY_INSTALLED: &str = "installed";
@@ -338,11 +348,28 @@ fn commit_effective_off(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+fn enable_tts_runtime(huddle: &mut HuddleState, voice: &str) -> Option<VoiceChangeWait> {
+    huddle.tts_enabled = true;
+    // OFF removes the pipeline. Clear a prior cancellation only when enabling
+    // a fresh pipeline; an idempotent ON write must not erase a voice
+    // transition that the existing worker still needs to drain.
+    if huddle.tts_pipeline.is_none() {
+        huddle
+            .tts_cancel
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    huddle.tts_pipeline.as_ref().and_then(|pipeline| {
+        pipeline
+            .select_voice(voice)
+            .map(|acknowledged| (Arc::clone(pipeline), acknowledged))
+    })
+}
+
 async fn apply_tts_settings(
     settings: TtsSettings,
     app: &AppHandle,
     state: &AppState,
-) -> Result<TtsSettings, String> {
+) -> Result<Option<VoiceChangeWait>, String> {
     if settings.version != CURRENT_VERSION {
         return Err(format!(
             "Unsupported text-to-speech settings version: {}",
@@ -366,18 +393,18 @@ async fn apply_tts_settings(
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))? =
         settings.clone();
 
+    let mut voice_change_wait = None;
     if settings.agent_text_to_speech {
-        let active = {
+        let (active, voice_change_ack) = {
             let mut huddle = state.huddle()?;
-            huddle.tts_enabled = true;
-            huddle
-                .tts_cancel
-                .store(false, std::sync::atomic::Ordering::Release);
-            if let Some(pipeline) = huddle.tts_pipeline.as_ref() {
-                pipeline.select_voice(&pocket_voice_name(&settings.voice_preferences));
-            }
-            matches!(huddle.phase, HuddlePhase::Connected | HuddlePhase::Active)
+            let voice_change_ack =
+                enable_tts_runtime(&mut huddle, &pocket_voice_name(&settings.voice_preferences));
+            (
+                matches!(huddle.phase, HuddlePhase::Connected | HuddlePhase::Active),
+                voice_change_ack,
+            )
         };
+        voice_change_wait = voice_change_ack;
         if active {
             if let Err(error) = super::pipeline::maybe_start_tts_pipeline(state).await {
                 eprintln!("buzz-desktop: could not hot-start text to speech: {error}");
@@ -385,7 +412,50 @@ async fn apply_tts_settings(
         }
         state.emit_huddle_state_changed();
     }
-    Ok(settings)
+    Ok(voice_change_wait)
+}
+
+fn current_settings(state: &AppState) -> Result<TtsSettings, String> {
+    state
+        .tts_settings
+        .lock()
+        .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))
+        .map(|settings| settings.clone())
+}
+
+async fn finish_voice_change(voice_change: Option<VoiceChangeWait>) -> Result<(), String> {
+    let Some((pipeline, acknowledged)) = voice_change else {
+        return Ok(());
+    };
+    wait_for_voice_change_ack(acknowledged, VOICE_CHANGE_ACK_TIMEOUT, || {
+        pipeline.is_finished()
+    })
+    .await
+}
+
+async fn wait_for_voice_change_ack(
+    mut acknowledged: tokio::sync::oneshot::Receiver<()>,
+    timeout: Duration,
+    mut worker_is_finished: impl FnMut() -> bool,
+) -> Result<(), String> {
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut acknowledged => return Ok(()),
+            _ = &mut deadline => {
+                return Err(
+                    "Pocket TTS is still finishing the previous voice. Turn Agent text to speech off and try again."
+                        .to_string(),
+                );
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                if worker_is_finished() {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 /// Compatibility command for the huddle speaker button. It updates the same
@@ -396,14 +466,17 @@ pub async fn set_tts_enabled(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TtsSettings, String> {
-    let _transition = state.tts_settings_transition.lock().await;
+    let transition = state.tts_settings_transition.lock().await;
     let mut settings = state
         .tts_settings
         .lock()
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))?
         .clone();
     settings.agent_text_to_speech = enabled;
-    apply_tts_settings(settings, &app, &state).await
+    let voice_change = apply_tts_settings(settings, &app, &state).await?;
+    drop(transition);
+    finish_voice_change(voice_change).await?;
+    current_settings(&state)
 }
 
 fn settings_with_pocket_voice(
@@ -436,14 +509,17 @@ pub async fn set_pocket_voice(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TtsSettings, String> {
-    let _transition = state.tts_settings_transition.lock().await;
+    let transition = state.tts_settings_transition.lock().await;
     let settings = state
         .tts_settings
         .lock()
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))?
         .clone();
     let settings = settings_with_pocket_voice(settings, &voice_key)?;
-    apply_tts_settings(settings, &app, &state).await
+    let voice_change = apply_tts_settings(settings, &app, &state).await?;
+    drop(transition);
+    finish_voice_change(voice_change).await?;
+    current_settings(&state)
 }
 
 #[tauri::command]
@@ -498,6 +574,49 @@ pub async fn preview_pocket_voice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stalled_voice_change_returns_an_actionable_error() {
+        let (_keep_pending, acknowledged) = tokio::sync::oneshot::channel();
+
+        let error = wait_for_voice_change_ack(acknowledged, Duration::from_millis(1), || false)
+            .await
+            .expect_err("stalled worker should time out");
+
+        assert!(error.contains("Turn Agent text to speech off"));
+    }
+
+    #[test]
+    fn idempotent_enable_preserves_an_existing_pipeline_cancel() {
+        let state = crate::app_state::build_app_state();
+        let model_dir = tempfile::tempdir().expect("temp model dir");
+        let cancel = state.huddle().expect("huddle state").tts_cancel.clone();
+        let pipeline = Arc::new(
+            super::super::tts::TtsPipeline::new_with_voice(
+                model_dir.path().to_path_buf(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Arc::clone(&cancel),
+                "reference_sample",
+                None,
+            )
+            .expect("pipeline"),
+        );
+        pipeline.shutdown();
+        for _ in 0..100 {
+            if pipeline.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(pipeline.is_finished(), "test pipeline should stop");
+
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        let mut huddle = state.huddle().expect("huddle state");
+        huddle.tts_pipeline = Some(pipeline);
+
+        assert!(enable_tts_runtime(&mut huddle, "reference_sample").is_none());
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[test]
     fn defaults_are_backwards_compatible_and_use_mary() {

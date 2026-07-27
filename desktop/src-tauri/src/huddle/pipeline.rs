@@ -16,7 +16,7 @@ use crate::events;
 
 use super::models;
 use super::relay_api::{self, fetch_channel_members, parse_channel_uuid};
-use super::state::{HuddlePhase, VoiceInputMode};
+use super::state::{HuddlePhase, HuddleState, VoiceInputMode};
 use super::stt;
 use super::tts;
 
@@ -216,7 +216,7 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let voice = state
+    let initial_voice = state
         .tts_settings
         .lock()
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))
@@ -224,7 +224,13 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
             super::tts_settings::pocket_voice_name(&settings.voice_preferences).to_string()
         })?;
     let constructed = tokio::task::spawn_blocking(move || {
-        tts::TtsPipeline::new_with_voice(model_dir, tts_active, tts_cancel, &voice, output_device)
+        tts::TtsPipeline::new_with_voice(
+            model_dir,
+            tts_active,
+            tts_cancel,
+            &initial_voice,
+            output_device,
+        )
     })
     .await;
     let pipeline = match constructed {
@@ -241,20 +247,38 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
         }
     };
 
-    {
-        let mut hs = state.huddle()?;
-        hs.tts_starting.store(false, Ordering::Release);
-        // Phase check: huddle may have been torn down during construction.
-        if !matches!(hs.phase, HuddlePhase::Connected | HuddlePhase::Active) {
-            return Ok(false);
-        }
-        // Final check: another path may have created a pipeline while we were constructing.
-        if hs.tts_pipeline.is_some() {
-            return Ok(false);
-        }
-        hs.tts_pipeline = Some(pipeline);
-    }
+    finalize_tts_pipeline_start(state, move |voice, huddle| {
+        pipeline.select_voice_before_publish(voice);
+        huddle.tts_pipeline = Some(pipeline);
+    })
+}
 
+/// Publish a constructed TTS pipeline against the latest settings.
+///
+/// Construction happens outside locks and can overlap a voice change or OFF
+/// transition. Holding the huddle lock while re-reading settings gives either
+/// transition a safe ordering: it updates the installed pipeline afterward,
+/// or this finalizer observes the new setting before publishing.
+fn finalize_tts_pipeline_start(
+    state: &AppState,
+    publish: impl FnOnce(&str, &mut HuddleState),
+) -> Result<bool, String> {
+    let mut huddle = state.huddle()?;
+    huddle.tts_starting.store(false, Ordering::Release);
+    if !huddle.tts_enabled
+        || !matches!(huddle.phase, HuddlePhase::Connected | HuddlePhase::Active)
+        || huddle.tts_pipeline.is_some()
+    {
+        return Ok(false);
+    }
+    let voice = state
+        .tts_settings
+        .lock()
+        .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))
+        .map(|settings| {
+            super::tts_settings::pocket_voice_name(&settings.voice_preferences).to_string()
+        })?;
+    publish(&voice, &mut huddle);
     Ok(true)
 }
 
@@ -363,4 +387,99 @@ pub(crate) fn spawn_transcription_task(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tts_start_race_tests {
+    use std::sync::{atomic::Ordering, Arc, Barrier, Mutex};
+
+    use crate::app_state::build_app_state;
+
+    use super::{finalize_tts_pipeline_start, HuddlePhase};
+
+    #[test]
+    fn construction_reconciles_a_voice_selected_while_starting() {
+        let state = Arc::new(build_app_state());
+        {
+            let mut huddle = state.huddle().expect("huddle state");
+            huddle.phase = HuddlePhase::Active;
+            huddle.tts_enabled = true;
+            huddle.tts_starting.store(true, Ordering::Release);
+        }
+
+        let constructed = Arc::new(Barrier::new(2));
+        let publish = Arc::new(Barrier::new(2));
+        let selected_voice = Arc::new(Mutex::new(None));
+        let worker_state = Arc::clone(&state);
+        let worker_constructed = Arc::clone(&constructed);
+        let worker_publish = Arc::clone(&publish);
+        let worker_voice = Arc::clone(&selected_voice);
+        let worker = std::thread::spawn(move || {
+            worker_constructed.wait();
+            worker_publish.wait();
+            finalize_tts_pipeline_start(&worker_state, |voice, _| {
+                *worker_voice.lock().expect("selected voice") = Some(voice.to_string());
+            })
+        });
+
+        constructed.wait();
+        assert!(state
+            .huddle()
+            .expect("huddle state")
+            .tts_starting
+            .load(Ordering::Acquire));
+        state
+            .tts_settings
+            .lock()
+            .expect("text-to-speech settings")
+            .voice_preferences = vec!["pocket:marius".to_string()];
+        publish.wait();
+
+        assert!(worker.join().expect("starter thread").expect("finalize"));
+        assert_eq!(
+            *selected_voice.lock().expect("selected voice"),
+            Some("marius".to_string())
+        );
+    }
+
+    #[test]
+    fn construction_is_discarded_when_disabled_while_starting() {
+        let state = Arc::new(build_app_state());
+        {
+            let mut huddle = state.huddle().expect("huddle state");
+            huddle.phase = HuddlePhase::Active;
+            huddle.tts_enabled = true;
+            huddle.tts_starting.store(true, Ordering::Release);
+        }
+
+        let constructed = Arc::new(Barrier::new(2));
+        let publish = Arc::new(Barrier::new(2));
+        let did_publish = Arc::new(Mutex::new(false));
+        let worker_state = Arc::clone(&state);
+        let worker_constructed = Arc::clone(&constructed);
+        let worker_publish = Arc::clone(&publish);
+        let worker_did_publish = Arc::clone(&did_publish);
+        let worker = std::thread::spawn(move || {
+            worker_constructed.wait();
+            worker_publish.wait();
+            finalize_tts_pipeline_start(&worker_state, |_, _| {
+                *worker_did_publish.lock().expect("publish flag") = true;
+            })
+        });
+
+        constructed.wait();
+        {
+            let mut huddle = state.huddle().expect("huddle state");
+            huddle.tts_enabled = false;
+        }
+        publish.wait();
+
+        assert!(!worker.join().expect("starter thread").expect("finalize"));
+        assert!(!*did_publish.lock().expect("publish flag"));
+        assert!(!state
+            .huddle()
+            .expect("huddle state")
+            .tts_starting
+            .load(Ordering::Acquire));
+    }
 }

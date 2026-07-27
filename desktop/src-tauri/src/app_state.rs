@@ -30,8 +30,9 @@ pub struct AppState {
     /// Workspace-provided relay URL override. Set by `apply_workspace` on app
     /// init and takes priority over env vars and compile-time defaults.
     pub relay_url_override: Mutex<Option<String>>,
-    /// Set during setup when managed agents are eligible for launch restore;
-    /// consumed after workspace identity/relay install to avoid the fallback.
+    /// Set during backend setup when managed agents are eligible for launch
+    /// restore. `apply_workspace` consumes it after installing the workspace
+    /// relay and identity, so agents never start against the fallback relay.
     pub managed_agent_restore_pending: AtomicBool,
     /// Whether desktop may repair managed-agent kind:0 profiles from its local
     /// records. Disabled by the agent-managed profiles experiment so an agent's
@@ -39,8 +40,8 @@ pub struct AppState {
     pub managed_agent_profile_reconcile_enabled: AtomicBool,
     /// Shared shutdown signal checked by launch-time agent restoration.
     pub shutdown_started: AtomicBool,
-    /// Serializes managed-runtime transitions that change the protected PID set:
-    /// spawn/register, adoption, stop, shutdown, and sweep snapshots.
+    /// Serializes every managed-runtime transition that changes the protected
+    /// PID set: spawn/register, adoption, stop, shutdown, and sweep snapshots.
     /// Never perform network I/O while holding this lock.
     pub managed_agent_runtime_transition: Mutex<()>,
     pub managed_agents_store_lock: Mutex<()>,
@@ -50,6 +51,11 @@ pub struct AppState {
     pub tts_settings: Mutex<crate::huddle::tts_settings::TtsSettings>,
     pub tts_settings_load_error: Mutex<Option<String>>,
     pub tts_settings_transition: tokio::sync::Mutex<()>,
+    /// Tauri app handle — stored after setup so huddle commands can emit
+    /// `huddle-state-changed` events without needing the handle threaded
+    /// through every call site.
+    ///
+    /// Set once during `setup()` in `lib.rs`; never cleared.
     pub app_handle: Mutex<Option<AppHandle>>,
     /// Selected audio output device name. `None` = system default.
     /// Used by `connect_audio_relay` and TTS pipeline when opening sinks.

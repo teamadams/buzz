@@ -35,10 +35,11 @@
 //! can gate microphone input while the agent is speaking.
 
 use std::{
+    collections::VecDeque,
     num::NonZero,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender},
         Arc, Mutex, MutexGuard, PoisonError,
     },
@@ -46,8 +47,49 @@ use std::{
     time::Duration,
 };
 
-use super::pocket::{load_text_to_speech, load_voice_style, SAMPLE_RATE, VOICE_FILE_EXT};
+use super::pocket::{
+    load_text_to_speech, load_voice_style, VoiceStyle, SAMPLE_RATE, VOICE_FILE_EXT,
+};
 use super::preprocessing::{preprocess_for_tts, split_sentences};
+
+#[derive(Debug)]
+struct PendingVoiceChange {
+    generation: u64,
+    acknowledged: tokio::sync::oneshot::Sender<()>,
+}
+
+type VoiceChangeAck = Arc<Mutex<Option<PendingVoiceChange>>>;
+type WorkerVoiceState = (Arc<Mutex<String>>, Arc<AtomicU64>, VoiceChangeAck);
+type WorkerCancelSignals = (Arc<AtomicBool>, Arc<AtomicBool>);
+type CancelTextState<'a> = (
+    &'a mpsc::Receiver<QueuedText>,
+    &'a mut VecDeque<QueuedText>,
+    &'a mut Option<QueuedText>,
+);
+type CancelSignals<'a> = (&'a AtomicBool, &'a AtomicBool);
+
+#[derive(Debug)]
+struct QueuedText {
+    generation: u64,
+    text: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TtsTextSender {
+    text_tx: SyncSender<QueuedText>,
+    generation: u64,
+}
+
+impl TtsTextSender {
+    pub(crate) fn send(&self, text: String) -> Result<(), String> {
+        self.text_tx
+            .send(QueuedText {
+                generation: self.generation,
+                text,
+            })
+            .map_err(|error| error.to_string())
+    }
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -122,7 +164,7 @@ const INTER_SENTENCE_SILENCE: f32 = 0.1;
 #[derive(Debug)]
 pub struct TtsPipeline {
     /// Send preprocessed text into the pipeline.
-    text_tx: SyncSender<String>,
+    text_tx: SyncSender<QueuedText>,
     /// `true` while the agent is speaking. Shared with the STT pipeline for gating.
     #[allow(dead_code)]
     pub tts_active: Arc<AtomicBool>,
@@ -132,9 +174,16 @@ pub struct TtsPipeline {
     /// Kept alive here so the Arc isn't dropped — the worker holds a clone.
     #[allow(dead_code)]
     cancel: Arc<AtomicBool>,
+    /// Internal cancellation used only for voice changes. Kept separate so a
+    /// concurrent human barge-in always clears every queued message.
+    voice_cancel: Arc<AtomicBool>,
     /// Selected manifest voice. The worker reloads only the lightweight style
     /// when this changes; the warmed Pocket engine and audio player stay alive.
     voice: Arc<Mutex<String>>,
+    /// Tags messages so a voice change drops only pre-change queue entries.
+    voice_generation: Arc<AtomicU64>,
+    /// Completed after the worker drains pre-change text and installs the new style.
+    voice_change_ack: VoiceChangeAck,
     /// Worker thread handle — taken on drop to join cleanly.
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -151,15 +200,21 @@ impl TtsPipeline {
         voice: &str,
         output_device: Option<String>,
     ) -> Result<Self, String> {
-        let (text_tx, text_rx) = mpsc::sync_channel::<String>(TEXT_QUEUE_DEPTH);
+        let (text_tx, text_rx) = mpsc::sync_channel::<QueuedText>(TEXT_QUEUE_DEPTH);
         let shutdown = Arc::new(AtomicBool::new(false));
         // cancel is passed in from HuddleState.tts_cancel — shared with STT for barge-in.
 
         let shutdown_worker = Arc::clone(&shutdown);
         let cancel_worker = Arc::clone(&cancel);
+        let voice_cancel = Arc::new(AtomicBool::new(false));
+        let worker_voice_cancel = Arc::clone(&voice_cancel);
         let tts_active_worker = Arc::clone(&tts_active);
         let voice = Arc::new(Mutex::new(voice.to_string()));
         let voice_worker = Arc::clone(&voice);
+        let voice_generation = Arc::new(AtomicU64::new(1));
+        let worker_voice_generation = Arc::clone(&voice_generation);
+        let voice_change_ack = Arc::new(Mutex::new(None));
+        let worker_voice_change_ack = Arc::clone(&voice_change_ack);
         let model_dir_worker = model_dir.clone();
 
         let handle = thread::Builder::new()
@@ -167,11 +222,15 @@ impl TtsPipeline {
             .spawn(move || {
                 tts_worker(
                     model_dir_worker,
-                    voice_worker,
+                    (
+                        voice_worker,
+                        worker_voice_generation,
+                        worker_voice_change_ack,
+                    ),
                     text_rx,
                     tts_active_worker,
                     shutdown_worker,
-                    cancel_worker,
+                    (cancel_worker, worker_voice_cancel),
                     output_device,
                 )
             })
@@ -182,7 +241,10 @@ impl TtsPipeline {
             tts_active,
             shutdown,
             cancel,
+            voice_cancel,
             voice,
+            voice_generation,
+            voice_change_ack,
             thread: Some(handle),
         })
     }
@@ -192,17 +254,25 @@ impl TtsPipeline {
     /// Non-blocking. Returns `Err` if the queue is full (bounded at
     /// `TEXT_QUEUE_DEPTH`) — caller may log and discard.
     pub fn speak(&self, text: String) -> Result<(), String> {
-        self.text_tx.try_send(text).map_err(|e| {
-            eprintln!("buzz-desktop: TTS queue saturated, dropping message: {e}");
-            format!("TTS queue full, dropping: {e}")
-        })
+        self.text_tx
+            .try_send(QueuedText {
+                generation: self.voice_generation.load(Ordering::Acquire),
+                text,
+            })
+            .map_err(|e| {
+                eprintln!("buzz-desktop: TTS queue saturated, dropping message: {e}");
+                format!("TTS queue full, dropping: {e}")
+            })
     }
 
     /// Clone the bounded queue sender so callers can apply backpressure without
     /// holding the huddle mutex. Disabling TTS drops the receiver and unblocks
     /// any waiting sender while the shared cancellation flag stops playback.
-    pub(crate) fn text_sender(&self) -> SyncSender<String> {
-        self.text_tx.clone()
+    pub(crate) fn text_sender(&self) -> TtsTextSender {
+        TtsTextSender {
+            text_tx: self.text_tx.clone(),
+            generation: self.voice_generation.load(Ordering::Acquire),
+        }
     }
 
     /// Select a bundled Pocket voice for subsequent speech.
@@ -210,9 +280,23 @@ impl TtsPipeline {
     /// Current playback and queued text are cancelled immediately so content
     /// cannot continue in the old voice. The worker keeps its warmed inference
     /// engine and reloads only the reference style before the next utterance.
-    pub fn select_voice(&self, voice: &str) {
+    pub fn select_voice(&self, voice: &str) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        begin_voice_change(
+            &self.voice,
+            &self.voice_generation,
+            &self.voice_cancel,
+            &self.voice_change_ack,
+            voice,
+        )
+    }
+
+    /// Reconcile the voice of a pipeline that has not been published yet.
+    ///
+    /// No caller can enqueue text before publication, so raising the shared
+    /// cancellation flag here would create a race that could discard the first
+    /// message queued immediately after installation.
+    pub(crate) fn select_voice_before_publish(&self, voice: &str) {
         *self.voice.lock().unwrap_or_else(|error| error.into_inner()) = voice.to_string();
-        self.cancel.store(true, Ordering::Release);
     }
 
     /// Signal the worker thread to stop.
@@ -242,13 +326,15 @@ impl Drop for TtsPipeline {
 
 fn tts_worker(
     model_dir: PathBuf,
-    selected_voice: Arc<Mutex<String>>,
-    text_rx: mpsc::Receiver<String>,
+    voice_state: WorkerVoiceState,
+    text_rx: mpsc::Receiver<QueuedText>,
     tts_active: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-    cancel: Arc<AtomicBool>,
+    cancel_signals: WorkerCancelSignals,
     output_device: Option<String>,
 ) {
+    let (selected_voice, voice_generation, voice_change_ack) = voice_state;
+    let (cancel, voice_cancel) = cancel_signals;
     // ── 1. Initialise TTS engine ──────────────────────────────────────────────
     let model_dir_str = model_dir.to_string_lossy().to_string();
 
@@ -259,7 +345,12 @@ fn tts_worker(
                 "buzz-desktop: TTS engine init failed (model_dir={}): {e}. TTS disabled.",
                 model_dir.display()
             );
-            drain_until_shutdown(text_rx, &shutdown);
+            drain_tts_until_shutdown(
+                text_rx,
+                &shutdown,
+                (&cancel, &voice_cancel),
+                &voice_change_ack,
+            );
             return;
         }
     };
@@ -276,7 +367,12 @@ fn tts_worker(
             eprintln!(
                 "buzz-desktop: TTS voice style load failed ({voice_name}): {e}. TTS disabled."
             );
-            drain_until_shutdown(text_rx, &shutdown);
+            drain_tts_until_shutdown(
+                text_rx,
+                &shutdown,
+                (&cancel, &voice_cancel),
+                &voice_change_ack,
+            );
             return;
         }
     };
@@ -309,7 +405,12 @@ fn tts_worker(
         Ok(h) => h,
         Err(e) => {
             eprintln!("buzz-desktop: TTS audio output failed: {e}. TTS disabled.");
-            drain_until_shutdown(text_rx, &shutdown);
+            drain_tts_until_shutdown(
+                text_rx,
+                &shutdown,
+                (&cancel, &voice_cancel),
+                &voice_change_ack,
+            );
             return;
         }
     };
@@ -379,6 +480,7 @@ fn tts_worker(
     let monitor = {
         let player = Arc::clone(&player);
         let cancel = Arc::clone(&cancel);
+        let voice_cancel = Arc::clone(&voice_cancel);
         let tts_active = Arc::clone(&tts_active);
         let stop = Arc::clone(&monitor_stop);
         let player_ops = Arc::clone(&player_ops);
@@ -386,12 +488,12 @@ fn tts_worker(
             .name("tts-barge-in-monitor".into())
             .spawn(move || {
                 while !stop.load(Ordering::Acquire) {
-                    if cancel.load(Ordering::Acquire) {
+                    if cancel.load(Ordering::Acquire) || voice_cancel.load(Ordering::Acquire) {
                         let _ops = lock_player_ops(&player_ops);
                         // Re-check under the lock: the worker may have
                         // consumed this cancel (and appended fresh audio)
                         // between the load above and the lock acquisition.
-                        if cancel.load(Ordering::Acquire) {
+                        if cancel.load(Ordering::Acquire) || voice_cancel.load(Ordering::Acquire) {
                             // clear() pauses the persistent player; play()
                             // un-pauses (see handle_cancel_or_shutdown).
                             // Idempotent — safe to repeat every tick until
@@ -425,13 +527,16 @@ fn tts_worker(
     // idle branch below uses it to decide when to drop `tts_active` and to
     // arm a fresh lead-in cushion for the next utterance.
     let mut first_append = true;
+    let mut deferred_text = VecDeque::new();
 
     loop {
+        let mut no_current_text = None;
         if handle_cancel_or_shutdown(
-            &cancel,
+            (&cancel, &voice_cancel),
             &shutdown,
             &tts_active,
-            &text_rx,
+            (&text_rx, &mut deferred_text, &mut no_current_text),
+            &voice_change_ack,
             Some((&player, &player_ops)),
         ) {
             if shutdown.load(Ordering::Acquire) {
@@ -446,71 +551,60 @@ fn tts_worker(
         // Voice changes cancel the old utterance/queue and are observed here,
         // before receiving subsequent text. A bad bundled asset falls back to
         // Mary without discarding the already-warmed Pocket engine.
-        let requested_voice = selected_voice
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        if requested_voice != voice_name {
-            let requested_path = model_dir.join(format!("{requested_voice}.{VOICE_FILE_EXT}"));
-            match load_voice_style(&requested_path) {
-                Ok(requested_style) => {
-                    style = requested_style;
-                    voice_name = requested_voice;
-                }
-                Err(error) => {
-                    use super::pocket::DEFAULT_VOICE;
-                    eprintln!(
-                        "buzz-desktop: Pocket voice {requested_voice} is unavailable ({error}); falling back to Mary"
-                    );
-                    let fallback_path = model_dir.join(format!("{DEFAULT_VOICE}.{VOICE_FILE_EXT}"));
-                    match load_voice_style(&fallback_path) {
-                        Ok(fallback_style) => {
-                            style = fallback_style;
-                            voice_name = DEFAULT_VOICE.to_string();
-                            *selected_voice
-                                .lock()
-                                .unwrap_or_else(|lock_error| lock_error.into_inner()) =
-                                DEFAULT_VOICE.to_string();
-                        }
-                        Err(fallback_error) => {
-                            eprintln!(
-                                "buzz-desktop: Mary voice fallback is unavailable: {fallback_error}"
-                            );
-                            continue;
-                        }
-                    }
-                }
-            }
+        let voice_ready =
+            reconcile_selected_voice(&model_dir, &selected_voice, &mut voice_name, &mut style);
+        acknowledge_voice_change(&voice_change_ack, &voice_cancel);
+        if !voice_ready {
+            continue;
         }
 
-        let raw_text = match text_rx.recv_timeout(RECV_TIMEOUT) {
-            Ok(t) => t,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Nothing queued. If playback has also finished, the agent
-                // has gone quiet — release the mic gate and reset the
-                // lead-in so the next utterance gets a fresh cushion.
-                if player.empty() && !first_append {
-                    tts_active.store(false, Ordering::Release);
-                    first_append = true;
+        let mut queued_text = Some(match deferred_text.pop_front() {
+            Some(text) => text,
+            None => match text_rx.recv_timeout(RECV_TIMEOUT) {
+                Ok(text) => text,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Nothing queued. If playback has also finished, the agent
+                    // has gone quiet — release the mic gate and reset the
+                    // lead-in so the next utterance gets a fresh cushion.
+                    if player.empty() && !first_append {
+                        tts_active.store(false, Ordering::Release);
+                        first_append = true;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+        });
 
         // Check cancel again after unblocking — a cancel may have arrived
         // while we were waiting.
         if handle_cancel_or_shutdown(
-            &cancel,
+            (&cancel, &voice_cancel),
             &shutdown,
             &tts_active,
-            &text_rx,
+            (&text_rx, &mut deferred_text, &mut queued_text),
+            &voice_change_ack,
             Some((&player, &player_ops)),
         ) {
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
             first_append = true;
+            continue;
+        }
+        let Some(queued_text) = queued_text else {
+            continue;
+        };
+        if queued_text.generation < voice_generation.load(Ordering::Acquire) {
+            continue;
+        }
+        let raw_text = queued_text.text;
+
+        // The selected voice can change while this worker is blocked in
+        // recv_timeout. Reconcile again after receipt so the first message
+        // queued after an unpublished pipeline is installed cannot use the
+        // voice captured when construction began.
+        if !reconcile_selected_voice(&model_dir, &selected_voice, &mut voice_name, &mut style) {
             continue;
         }
 
@@ -547,11 +641,13 @@ fn tts_worker(
         let chunks = group_sentences_into_chunks(&sentences, MAX_CHUNK_CHARS);
 
         for chunk in &chunks {
+            let mut no_current_text = None;
             if handle_cancel_or_shutdown(
-                &cancel,
+                (&cancel, &voice_cancel),
                 &shutdown,
                 &tts_active,
-                &text_rx,
+                (&text_rx, &mut deferred_text, &mut no_current_text),
+                &voice_change_ack,
                 Some((&player, &player_ops)),
             ) {
                 first_append = true;
@@ -591,7 +687,7 @@ fn tts_worker(
                     // does the full consume (drain queue, reset lead-in) on
                     // the next iteration.
                     let _ops = lock_player_ops(&player_ops);
-                    if cancel.load(Ordering::Acquire) {
+                    if cancel.load(Ordering::Acquire) || voice_cancel.load(Ordering::Acquire) {
                         // Nothing appended; the loop-top consume re-arms
                         // `first_append` (the flag is still set — the worker
                         // is its only consumer).
@@ -624,10 +720,132 @@ fn tts_worker(
         let _ = handle.join();
     }
 
+    finish_voice_change_ack(&voice_change_ack);
     tts_active.store(false, Ordering::Release);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn begin_voice_change(
+    selected_voice: &Mutex<String>,
+    voice_generation: &AtomicU64,
+    voice_cancel: &AtomicBool,
+    voice_change_ack: &VoiceChangeAck,
+    voice: &str,
+) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let mut pending_ack = voice_change_ack
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut selected = selected_voice
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if selected.as_str() == voice {
+        return None;
+    }
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    voice_cancel.store(true, Ordering::Release);
+    let generation = voice_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    if let Some(superseded) = pending_ack.replace(PendingVoiceChange {
+        generation,
+        acknowledged: sender,
+    }) {
+        let _ = superseded.acknowledged.send(());
+    }
+    *selected = voice.to_string();
+    Some(receiver)
+}
+
+fn acknowledge_voice_change(voice_change_ack: &VoiceChangeAck, voice_cancel: &AtomicBool) {
+    let mut pending_ack = voice_change_ack
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if voice_cancel.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(pending) = pending_ack.take() {
+        let _ = pending.acknowledged.send(());
+    }
+}
+
+fn finish_voice_change_ack(voice_change_ack: &VoiceChangeAck) {
+    if let Some(pending) = voice_change_ack
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+    {
+        let _ = pending.acknowledged.send(());
+    }
+}
+
+fn drain_tts_until_shutdown(
+    text_rx: mpsc::Receiver<QueuedText>,
+    shutdown: &AtomicBool,
+    cancel_signals: CancelSignals<'_>,
+    voice_change_ack: &VoiceChangeAck,
+) {
+    let (cancel, voice_cancel) = cancel_signals;
+    loop {
+        if cancel.swap(false, Ordering::AcqRel) | voice_cancel.swap(false, Ordering::AcqRel) {
+            while text_rx.try_recv().is_ok() {}
+        }
+        acknowledge_voice_change(voice_change_ack, voice_cancel);
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        match text_rx.recv_timeout(RECV_TIMEOUT) {
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    finish_voice_change_ack(voice_change_ack);
+}
+
+fn reconcile_selected_voice(
+    model_dir: &std::path::Path,
+    selected_voice: &Mutex<String>,
+    voice_name: &mut String,
+    style: &mut VoiceStyle,
+) -> bool {
+    let requested_voice = selected_voice
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    if requested_voice == *voice_name {
+        return true;
+    }
+
+    let requested_path = model_dir.join(format!("{requested_voice}.{VOICE_FILE_EXT}"));
+    match load_voice_style(&requested_path) {
+        Ok(requested_style) => {
+            *style = requested_style;
+            *voice_name = requested_voice;
+            true
+        }
+        Err(error) => {
+            use super::pocket::DEFAULT_VOICE;
+            eprintln!(
+                "buzz-desktop: Pocket voice {requested_voice} is unavailable ({error}); falling back to Mary"
+            );
+            let fallback_path = model_dir.join(format!("{DEFAULT_VOICE}.{VOICE_FILE_EXT}"));
+            match load_voice_style(&fallback_path) {
+                Ok(fallback_style) => {
+                    *style = fallback_style;
+                    *voice_name = DEFAULT_VOICE.to_string();
+                    *selected_voice
+                        .lock()
+                        .unwrap_or_else(|lock_error| lock_error.into_inner()) =
+                        DEFAULT_VOICE.to_string();
+                    true
+                }
+                Err(fallback_error) => {
+                    eprintln!("buzz-desktop: Mary voice fallback is unavailable: {fallback_error}");
+                    false
+                }
+            }
+        }
+    }
+}
 
 /// Check for cancel or shutdown. Returns `true` if the caller should break/continue.
 /// On cancel: drains the text queue and clears the cancel flag.
@@ -637,12 +855,15 @@ fn tts_worker(
 /// it is serialized with the monitor's stale-branch re-check (see the monitor
 /// block in `tts_worker`).
 fn handle_cancel_or_shutdown(
-    cancel: &AtomicBool,
+    cancel_signals: CancelSignals<'_>,
     shutdown: &AtomicBool,
     tts_active: &AtomicBool,
-    text_rx: &mpsc::Receiver<String>,
+    text_state: CancelTextState<'_>,
+    voice_change_ack: &VoiceChangeAck,
     player: Option<(&rodio::Player, &Mutex<()>)>,
 ) -> bool {
+    let (cancel, voice_cancel) = cancel_signals;
+    let (text_rx, deferred_text, current_text) = text_state;
     if shutdown.load(Ordering::Acquire) {
         if let Some((p, ops)) = player {
             let _ops = lock_player_ops(ops);
@@ -651,7 +872,24 @@ fn handle_cancel_or_shutdown(
         tts_active.store(false, Ordering::Release);
         return true;
     }
-    if cancel.load(Ordering::Acquire) {
+    if cancel.load(Ordering::Acquire) || voice_cancel.load(Ordering::Acquire) {
+        // Serialize with begin_voice_change so the generation boundary and
+        // cancel consumption are observed as one transition.
+        let pending_voice_change = voice_change_ack
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Consume at the serialization point. A later barge-in remains true
+        // for the next pass instead of being overwritten after queue cleanup.
+        let barge_in = cancel.swap(false, Ordering::AcqRel);
+        voice_cancel.store(false, Ordering::Release);
+        let preserve_generation = (!barge_in)
+            .then(|| {
+                pending_voice_change
+                    .as_ref()
+                    .map(|pending| pending.generation)
+            })
+            .flatten();
+        retain_cancelled_text(deferred_text, current_text, text_rx, preserve_generation);
         if let Some((p, ops)) = player {
             let _ops = lock_player_ops(ops);
             // `Player::clear()` removes queued sources AND pauses the player
@@ -664,16 +902,36 @@ fn handle_cancel_or_shutdown(
             // Consume the flag under the lock: once released with
             // `cancel == false`, the monitor's stale branch no-ops instead
             // of clearing the fresh post-cancel utterance.
-            while text_rx.try_recv().is_ok() {}
-            cancel.store(false, Ordering::Release);
-        } else {
-            while text_rx.try_recv().is_ok() {}
-            cancel.store(false, Ordering::Release);
         }
         tts_active.store(false, Ordering::Release);
         return true;
     }
     false
+}
+
+fn retain_cancelled_text(
+    deferred_text: &mut VecDeque<QueuedText>,
+    current_text: &mut Option<QueuedText>,
+    text_rx: &mpsc::Receiver<QueuedText>,
+    preserve_generation: Option<u64>,
+) {
+    if let Some(generation) = preserve_generation {
+        deferred_text.retain(|text| text.generation >= generation);
+        if let Some(text) = current_text.take() {
+            if text.generation >= generation {
+                deferred_text.push_front(text);
+            }
+        }
+        while let Ok(text) = text_rx.try_recv() {
+            if text.generation >= generation {
+                deferred_text.push_back(text);
+            }
+        }
+    } else {
+        deferred_text.clear();
+        current_text.take();
+        while text_rx.try_recv().is_ok() {}
+    }
 }
 
 /// Acquire the `player_ops` lock, recovering from poison.
@@ -809,9 +1067,6 @@ fn group_sentences_into_chunks(sentences: &[String], max_chars: usize) -> Vec<St
     }
     chunks
 }
-
-// drain_until_shutdown lives in super (huddle/mod.rs) — shared with stt.rs.
-use super::drain_until_shutdown;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
