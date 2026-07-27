@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { commitPlaybackSpeed } from "./playbackSpeedPersistence.ts";
+import {
+  applyLoadedPlaybackSpeed,
+  commitPlaybackSpeed,
+} from "./playbackSpeedPersistence.ts";
 
 function deferred() {
   let resolve;
@@ -22,6 +25,7 @@ function harness() {
     confirmedSpeed: { current: 1 },
     desiredSpeed: { current: 1 },
     flushPromise: { current: null },
+    hasLocalIntent: { current: false },
   };
   const callbacks = {
     persist: (speed) => {
@@ -85,4 +89,18 @@ test("the latest failure rolls back to the last confirmed speed", async () => {
   assert.equal(h.state.desiredSpeed.current, 1);
   assert.deepEqual(h.speeds, [1.25, 1]);
   assert.equal(h.errors.at(-1), "Error: save failed");
+});
+
+test("a delayed initial load cannot overwrite a local intent", async () => {
+  const h = harness();
+  commitPlaybackSpeed(h.state, h.callbacks, 1.5);
+  applyLoadedPlaybackSpeed(h.state, h.callbacks, 1);
+
+  assert.equal(h.state.desiredSpeed.current, 1.5);
+  assert.deepEqual(h.speeds, [1.5]);
+
+  h.saves[0].resolve();
+  await settle(h.state);
+  assert.equal(h.state.confirmedSpeed.current, 1.5);
+  assert.equal(h.state.desiredSpeed.current, 1.5);
 });

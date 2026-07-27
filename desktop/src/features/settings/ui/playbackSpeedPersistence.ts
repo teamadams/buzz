@@ -6,6 +6,7 @@ export type PlaybackSpeedPersistenceState = {
   confirmedSpeed: MutableValue<number>;
   desiredSpeed: MutableValue<number>;
   flushPromise: MutableValue<Promise<void> | null>;
+  hasLocalIntent: MutableValue<boolean>;
 };
 
 type PlaybackSpeedPersistenceCallbacks = {
@@ -19,10 +20,22 @@ export function commitPlaybackSpeed(
   callbacks: PlaybackSpeedPersistenceCallbacks,
   nextSpeed: number,
 ) {
+  state.hasLocalIntent.current = true;
   state.desiredSpeed.current = nextSpeed;
   callbacks.setSpeed(nextSpeed);
   callbacks.setError(null);
   ensurePlaybackSpeedFlush(state, callbacks);
+}
+
+export function applyLoadedPlaybackSpeed(
+  state: PlaybackSpeedPersistenceState,
+  callbacks: Pick<PlaybackSpeedPersistenceCallbacks, "setSpeed">,
+  savedSpeed: number,
+) {
+  if (state.hasLocalIntent.current) return;
+  state.confirmedSpeed.current = savedSpeed;
+  state.desiredSpeed.current = savedSpeed;
+  callbacks.setSpeed(savedSpeed);
 }
 
 function ensurePlaybackSpeedFlush(

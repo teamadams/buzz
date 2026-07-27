@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { getTtsPlaybackSpeed, setTtsPlaybackSpeed } from "@/shared/api/tauri";
 import { Button } from "@/shared/ui/button";
-import { commitPlaybackSpeed } from "./playbackSpeedPersistence";
+import {
+  applyLoadedPlaybackSpeed,
+  commitPlaybackSpeed,
+} from "./playbackSpeedPersistence";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
 
 const DEFAULT_SPEED = 1;
@@ -12,22 +15,34 @@ const SPEED_STEP = 0.05;
 export function SpeechPlaybackSettings() {
   const [speed, setSpeed] = useState(DEFAULT_SPEED);
   const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
   const confirmedSpeed = useRef(DEFAULT_SPEED);
   const desiredSpeed = useRef(DEFAULT_SPEED);
   const flushPromise = useRef<Promise<void> | null>(null);
+  const hasLocalIntent = useRef(false);
 
   useEffect(() => {
     let active = true;
     getTtsPlaybackSpeed()
       .then((savedSpeed) => {
         if (active) {
-          confirmedSpeed.current = savedSpeed;
-          desiredSpeed.current = savedSpeed;
-          setSpeed(savedSpeed);
+          applyLoadedPlaybackSpeed(
+            {
+              confirmedSpeed,
+              desiredSpeed,
+              flushPromise,
+              hasLocalIntent,
+            },
+            { setSpeed },
+            savedSpeed,
+          );
         }
       })
       .catch((cause) => {
         if (active) setError(String(cause));
+      })
+      .finally(() => {
+        if (active) setLoaded(true);
       });
     return () => {
       active = false;
@@ -36,7 +51,7 @@ export function SpeechPlaybackSettings() {
 
   const commitSpeed = (nextSpeed: number) => {
     commitPlaybackSpeed(
-      { confirmedSpeed, desiredSpeed, flushPromise },
+      { confirmedSpeed, desiredSpeed, flushPromise, hasLocalIntent },
       { persist: setTtsPlaybackSpeed, setError, setSpeed },
       nextSpeed,
     );
@@ -66,7 +81,7 @@ export function SpeechPlaybackSettings() {
                 {speed.toFixed(2)}x
               </span>
               <Button
-                disabled={speed === DEFAULT_SPEED}
+                disabled={!loaded || speed === DEFAULT_SPEED}
                 onClick={() => commitSpeed(DEFAULT_SPEED)}
                 size="sm"
                 type="button"
@@ -79,6 +94,7 @@ export function SpeechPlaybackSettings() {
           <input
             aria-valuetext={`${speed.toFixed(2)} times`}
             className="mt-3 w-full accent-primary"
+            disabled={!loaded}
             id="speech-playback-speed"
             max={MAX_SPEED}
             min={MIN_SPEED}
