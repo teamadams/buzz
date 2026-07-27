@@ -48,7 +48,7 @@ export function SpeechPlaybackSettings() {
   };
 
   return (
-    <SettingsOptionGroup className="mt-8">
+    <SettingsOptionGroup>
       <SettingsOptionRow className="items-start">
         <div className="min-w-0 flex-1">
           <div className="flex items-center justify-between gap-4">

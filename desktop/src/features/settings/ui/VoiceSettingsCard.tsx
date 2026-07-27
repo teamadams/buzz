@@ -14,6 +14,7 @@ import {
 import { Switch } from "@/shared/ui/switch";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
+import { SpeechPlaybackSettings } from "./SpeechPlaybackSettings";
 import {
   selectedVoiceForBackend,
   type VoiceRegistryEntry,
@@ -236,6 +237,8 @@ export function VoiceSettingsCard() {
             </SettingsOptionRow>
           </SettingsOptionGroup>
         </div>
+
+        <SpeechPlaybackSettings />
 
         {error && (
           <p
