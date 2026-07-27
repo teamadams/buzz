@@ -13,6 +13,7 @@ fn selecting_a_voice_raises_only_the_internal_cancel_and_retains_the_engine_hand
         Arc::clone(&cancel),
         "reference_sample",
         None,
+        PlaybackSpeedControl::default(),
     )
     .expect("pipeline handle");
 

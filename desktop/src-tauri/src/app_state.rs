@@ -60,6 +60,7 @@ pub struct AppState {
     /// Selected audio output device name. `None` = system default.
     /// Used by `connect_audio_relay` and TTS pipeline when opening sinks.
     pub audio_output_device: Mutex<Option<String>>,
+    pub tts_playback_speed: crate::huddle::playback_speed::PlaybackSpeedControl,
     /// Port of the localhost media streaming proxy (set during setup).
     pub media_proxy_port: AtomicU16,
     /// Set when identity resolution detected a "keyring-locked" state: the
@@ -221,6 +222,7 @@ pub fn build_app_state() -> AppState {
         tts_settings_transition: tokio::sync::Mutex::new(()),
         app_handle: Mutex::new(None),
         audio_output_device: Mutex::new(None),
+        tts_playback_speed: crate::huddle::playback_speed::PlaybackSpeedControl::default(),
         media_proxy_port: AtomicU16::new(0),
         prevent_sleep: Arc::new(Mutex::new(
             crate::prevent_sleep::PreventSleepState::default(),

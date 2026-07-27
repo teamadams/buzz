@@ -1197,6 +1197,14 @@ export const setPreventSleepActive = (active: boolean) =>
 export const setAgentManagedProfiles = (enabled: boolean) =>
   invokeTauri("set_agent_managed_profiles", { enabled });
 
+export function getTtsPlaybackSpeed(): Promise<number> {
+  return invokeTauri<number>("get_tts_playback_speed");
+}
+
+export function setTtsPlaybackSpeed(speed: number): Promise<void> {
+  return invokeTauri<void>("set_tts_playback_speed", { speed });
+}
+
 /** Returns true on macOS, Windows, and Linux AppImage installs.
  *  Returns false on Linux non-AppImage packages (e.g. .deb) where
  *  Tauri's updater cannot swap the binary. */

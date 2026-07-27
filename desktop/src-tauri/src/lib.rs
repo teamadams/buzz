@@ -39,6 +39,7 @@ use deep_link::{
 use huddle::audio_output::{
     get_audio_output_device, list_audio_output_devices, set_audio_output_device,
 };
+use huddle::playback_speed::{get_tts_playback_speed, load_playback_speed, set_tts_playback_speed};
 use huddle::reconnect::reconnect_huddle_audio;
 use huddle::{
     add_agent_to_huddle, check_pipeline_hotstart, confirm_huddle_active, download_voice_models,
@@ -400,6 +401,9 @@ pub fn run() {
             // that will be lost on restart, as that silently breaks channel
             // memberships, DMs, and relay identity.
             let state = app_handle.state::<AppState>();
+            if let Err(error) = load_playback_speed(&app_handle, &state.tts_playback_speed) {
+                eprintln!("buzz-desktop: failed to load TTS playback speed; using 1x: {error}");
+            }
             if let Err(e) = resolve_persisted_identity(&app_handle, &state) {
                 eprintln!("buzz-desktop: fatal: identity resolution failed: {e}");
                 std::process::exit(1);
@@ -904,6 +908,8 @@ pub fn run() {
             list_audio_output_devices,
             set_audio_output_device,
             get_audio_output_device,
+            get_tts_playback_speed,
+            set_tts_playback_speed,
             start_pairing,
             confirm_pairing_sas,
             cancel_pairing,

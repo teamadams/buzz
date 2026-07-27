@@ -47,6 +47,7 @@ use std::{
     time::Duration,
 };
 
+use super::playback_speed::{PlaybackSpeedControl, PlaybackSpeedProcessor};
 use super::pocket::{load_text_to_speech, load_voice_style, SAMPLE_RATE, VOICE_FILE_EXT};
 use super::preprocessing::{preprocess_for_tts, split_sentences};
 
@@ -162,6 +163,7 @@ impl TtsPipeline {
         cancel: Arc<AtomicBool>,
         voice: &str,
         output_device: Option<String>,
+        playback_speed: PlaybackSpeedControl,
     ) -> Result<Self, String> {
         let (text_tx, text_rx) = mpsc::sync_channel::<QueuedText>(TEXT_QUEUE_DEPTH);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -183,19 +185,20 @@ impl TtsPipeline {
         let handle = thread::Builder::new()
             .name("tts-worker".into())
             .spawn(move || {
-                tts_worker(
-                    model_dir_worker,
-                    (
+                let config = TtsWorkerConfig {
+                    model_dir: model_dir_worker,
+                    voice_state: (
                         voice_worker,
                         worker_voice_generation,
                         worker_voice_change_ack,
                     ),
-                    text_rx,
-                    tts_active_worker,
-                    shutdown_worker,
-                    (cancel_worker, worker_voice_cancel),
+                    tts_active: tts_active_worker,
+                    shutdown: shutdown_worker,
+                    cancel_signals: (cancel_worker, worker_voice_cancel),
                     output_device,
-                )
+                    playback_speed,
+                };
+                tts_worker(config, text_rx)
             })
             .map_err(|e| format!("failed to spawn tts-worker thread: {e}"))?;
 
@@ -287,15 +290,26 @@ impl Drop for TtsPipeline {
 
 // ── Worker thread ─────────────────────────────────────────────────────────────
 
-fn tts_worker(
+struct TtsWorkerConfig {
     model_dir: PathBuf,
     voice_state: WorkerVoiceState,
-    text_rx: mpsc::Receiver<QueuedText>,
     tts_active: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     cancel_signals: WorkerCancelSignals,
     output_device: Option<String>,
-) {
+    playback_speed: PlaybackSpeedControl,
+}
+
+fn tts_worker(config: TtsWorkerConfig, text_rx: mpsc::Receiver<QueuedText>) {
+    let TtsWorkerConfig {
+        model_dir,
+        voice_state,
+        tts_active,
+        shutdown,
+        cancel_signals,
+        output_device,
+        playback_speed,
+    } = config;
     let (selected_voice, voice_generation, voice_change_ack) = voice_state;
     let (cancel, voice_cancel) = cancel_signals;
     // ── 1. Initialise TTS engine ──────────────────────────────────────────────
@@ -637,6 +651,19 @@ fn tts_worker(
                     // every chunk a quiet device warm-up window.
                     let buf =
                         build_sentence_append_buffer(&mut first_append, audio, silence_buf_len);
+                    let speed = playback_speed.get();
+                    let buf = match PlaybackSpeedProcessor::new(speed, SAMPLE_RATE)
+                        .and_then(|mut processor| processor.process_complete_chunk(&buf))
+                    {
+                        Ok(processed) => processed,
+                        Err(error) => {
+                            eprintln!(
+                                "buzz-desktop: TTS playback-speed processing failed at {speed:.2}x: \
+                                 {error}; using 1x playback"
+                            );
+                            buf
+                        }
+                    };
 
                     // Check-and-append under `player_ops`, serialized with
                     // the monitor: a barge-in may have arrived during
