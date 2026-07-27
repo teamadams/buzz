@@ -9489,7 +9489,10 @@ export function maybeInstallE2eTauriMocks() {
           voicePreferences: activeConfig?.mock?.ttsSettings
             ?.voicePreferences ?? ["pocket:mary"],
         };
-        if (activeConfig?.mock) activeConfig.mock.ttsSettings = settings;
+        if (activeConfig) {
+          activeConfig.mock ??= {};
+          activeConfig.mock.ttsSettings = settings;
+        }
         return settings;
       }
       case "set_pocket_voice": {
@@ -9512,7 +9515,10 @@ export function maybeInstallE2eTauriMocks() {
           voiceKey,
         );
         const settings = { ...current, voicePreferences: preferences };
-        if (activeConfig?.mock) activeConfig.mock.ttsSettings = settings;
+        if (activeConfig) {
+          activeConfig.mock ??= {};
+          activeConfig.mock.ttsSettings = settings;
+        }
         return settings;
       }
       case "preview_pocket_voice":

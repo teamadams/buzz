@@ -29,6 +29,9 @@ test.describe("Pocket voice settings", () => {
     );
 
     await page.getByTestId("agent-text-to-speech-toggle").click();
+    await expect(
+      page.getByTestId("agent-text-to-speech-toggle"),
+    ).toHaveAttribute("aria-checked", "false");
     await expect(page.getByTestId("pocket-voice-controls")).toHaveAttribute(
       "aria-disabled",
       "true",
