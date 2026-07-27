@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { getTtsPlaybackSpeed, setTtsPlaybackSpeed } from "@/shared/api/tauri";
 import { Button } from "@/shared/ui/button";
+import { commitPlaybackSpeed } from "./playbackSpeedPersistence";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
 
 const DEFAULT_SPEED = 1;
@@ -11,14 +12,17 @@ const SPEED_STEP = 0.05;
 export function SpeechPlaybackSettings() {
   const [speed, setSpeed] = useState(DEFAULT_SPEED);
   const [error, setError] = useState<string | null>(null);
-  const committedSpeed = useRef(DEFAULT_SPEED);
+  const confirmedSpeed = useRef(DEFAULT_SPEED);
+  const desiredSpeed = useRef(DEFAULT_SPEED);
+  const flushPromise = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     let active = true;
     getTtsPlaybackSpeed()
       .then((savedSpeed) => {
         if (active) {
-          committedSpeed.current = savedSpeed;
+          confirmedSpeed.current = savedSpeed;
+          desiredSpeed.current = savedSpeed;
           setSpeed(savedSpeed);
         }
       })
@@ -30,21 +34,12 @@ export function SpeechPlaybackSettings() {
     };
   }, []);
 
-  const commitSpeed = async (nextSpeed: number) => {
-    const previous = committedSpeed.current;
-    if (nextSpeed === previous) return;
-    committedSpeed.current = nextSpeed;
-    setSpeed(nextSpeed);
-    setError(null);
-    try {
-      await setTtsPlaybackSpeed(nextSpeed);
-    } catch (cause) {
-      if (committedSpeed.current === nextSpeed) {
-        committedSpeed.current = previous;
-        setSpeed(previous);
-        setError(String(cause));
-      }
-    }
+  const commitSpeed = (nextSpeed: number) => {
+    commitPlaybackSpeed(
+      { confirmedSpeed, desiredSpeed, flushPromise },
+      { persist: setTtsPlaybackSpeed, setError, setSpeed },
+      nextSpeed,
+    );
   };
 
   return (

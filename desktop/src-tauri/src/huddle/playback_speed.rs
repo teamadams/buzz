@@ -29,24 +29,38 @@ const UNITY_EPSILON: f32 = 0.000_1;
 
 /// Lock-free shared control read by the TTS worker before each synthesis chunk.
 #[derive(Clone, Debug)]
-pub struct PlaybackSpeedControl(Arc<AtomicU32>);
+pub struct PlaybackSpeedControl {
+    speed: Arc<AtomicU32>,
+    transition: Arc<tokio::sync::Mutex<()>>,
+}
 
 impl Default for PlaybackSpeedControl {
     fn default() -> Self {
-        Self(Arc::new(AtomicU32::new(DEFAULT_PLAYBACK_SPEED.to_bits())))
+        Self {
+            speed: Arc::new(AtomicU32::new(DEFAULT_PLAYBACK_SPEED.to_bits())),
+            transition: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 }
 
 impl PlaybackSpeedControl {
     /// Return the current generated-speech playback speed.
     pub fn get(&self) -> f32 {
-        f32::from_bits(self.0.load(Ordering::Acquire))
+        f32::from_bits(self.speed.load(Ordering::Acquire))
     }
 
     /// Update the in-memory speed after validation.
     pub fn set(&self, speed: f32) -> Result<(), String> {
         validate_speed(speed)?;
-        self.0.store(speed.to_bits(), Ordering::Release);
+        self.speed.store(speed.to_bits(), Ordering::Release);
+        Ok(())
+    }
+
+    async fn persist_to_path(&self, path: &Path, speed: f32) -> Result<(), String> {
+        validate_speed(speed)?;
+        let _transition = self.transition.lock().await;
+        save_to_path(path, speed)?;
+        self.speed.store(speed.to_bits(), Ordering::Release);
         Ok(())
     }
 }
@@ -71,14 +85,15 @@ pub fn get_tts_playback_speed(state: State<'_, AppState>) -> f32 {
 
 /// Persist and apply the global generated-speech playback speed.
 #[tauri::command]
-pub fn set_tts_playback_speed(
+pub async fn set_tts_playback_speed(
     speed: f32,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    validate_speed(speed)?;
-    save_to_path(&settings_path(&app)?, speed)?;
-    state.tts_playback_speed.set(speed)
+    state
+        .tts_playback_speed
+        .persist_to_path(&settings_path(&app)?, speed)
+        .await
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -318,6 +333,44 @@ mod tests {
 
         std::fs::write(&path, br#"{"speed":2.0}"#).expect("invalid fixture");
         assert!(load_from_path(&path).is_err());
+    }
+
+    #[tokio::test]
+    async fn serialized_persistence_finishes_with_the_latest_speed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join(SETTINGS_FILE);
+        let control = PlaybackSpeedControl::default();
+        let transition = control.transition.lock().await;
+
+        let (first_enqueued_tx, first_enqueued_rx) = tokio::sync::oneshot::channel();
+        let first_control = control.clone();
+        let first_path = path.clone();
+        let first = tokio::spawn(async move {
+            first_enqueued_tx.send(()).expect("signal first waiter");
+            first_control.persist_to_path(&first_path, 1.25).await
+        });
+        first_enqueued_rx.await.expect("first waiter started");
+        tokio::task::yield_now().await;
+
+        let (second_enqueued_tx, second_enqueued_rx) = tokio::sync::oneshot::channel();
+        let second_control = control.clone();
+        let second_path = path.clone();
+        let second = tokio::spawn(async move {
+            second_enqueued_tx.send(()).expect("signal second waiter");
+            second_control.persist_to_path(&second_path, 1.5).await
+        });
+        second_enqueued_rx.await.expect("second waiter started");
+        tokio::task::yield_now().await;
+
+        drop(transition);
+        first.await.expect("join first save").expect("first save");
+        second
+            .await
+            .expect("join second save")
+            .expect("second save");
+
+        assert_eq!(load_from_path(&path).expect("load final speed"), 1.5);
+        assert_eq!(control.get(), 1.5);
     }
 
     fn zero_crossing_frequency(samples: &[f32], sample_rate: u32) -> f32 {
