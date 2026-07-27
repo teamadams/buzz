@@ -273,6 +273,35 @@ mod tests {
     }
 
     #[test]
+    fn complete_processing_preserves_onset_timing() {
+        let input: Vec<f32> = (0..SAMPLE_RATE)
+            .map(|sample| {
+                if (4_800..12_000).contains(&sample) || sample >= 16_800 {
+                    (2.0 * std::f32::consts::PI * 220.0 * sample as f32 / SAMPLE_RATE as f32).sin()
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let output = process_complete_chunk(&input, 1.25, SAMPLE_RATE).expect("complete output");
+        let active_windows = active_window_starts(&output, 240, 0.15);
+
+        let first_onset = *active_windows.first().expect("first tone onset");
+        let second_onset = active_windows
+            .windows(2)
+            .find_map(|pair| (pair[1] > pair[0] + 480).then_some(pair[1]))
+            .expect("second tone onset");
+        assert!(
+            (3_200..=4_400).contains(&first_onset),
+            "first onset shifted to sample {first_onset}"
+        );
+        assert!(
+            (12_800..=14_000).contains(&second_onset),
+            "second onset shifted to sample {second_onset}"
+        );
+    }
+
+    #[test]
     fn non_unity_latency_stays_below_75_ms() {
         let mut stretch = ssstretch::Stretch::new();
         stretch.preset_default(1, SAMPLE_RATE as f32);
@@ -301,5 +330,15 @@ mod tests {
 
     fn root_mean_square(samples: &[f32]) -> f32 {
         (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    fn active_window_starts(samples: &[f32], window: usize, threshold: f32) -> Vec<usize> {
+        samples
+            .chunks_exact(window)
+            .enumerate()
+            .filter_map(|(index, chunk)| {
+                (root_mean_square(chunk) > threshold).then_some(index * window)
+            })
+            .collect()
     }
 }
