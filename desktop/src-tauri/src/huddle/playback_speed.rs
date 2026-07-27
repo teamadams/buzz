@@ -5,6 +5,7 @@
 //! rodio's speed control because rodio changes pitch and speed together.
 
 use std::{
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -12,6 +13,7 @@ use std::{
     },
 };
 
+use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
@@ -125,7 +127,13 @@ fn save_to_path(path: &Path, speed: f32) -> Result<(), String> {
     }
     let payload = serde_json::to_vec_pretty(&PersistedPlaybackSettings { speed })
         .map_err(|error| format!("serialize TTS playback settings: {error}"))?;
-    crate::managed_agents::storage::atomic_write_json(path, &payload)
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut file = AtomicWriteFile::open(&resolved)
+        .map_err(|error| format!("open {} for atomic write: {error}", resolved.display()))?;
+    file.write_all(&payload)
+        .map_err(|error| format!("write {}: {error}", resolved.display()))?;
+    file.commit()
+        .map_err(|error| format!("commit {}: {error}", resolved.display()))
 }
 
 #[cfg(test)]
