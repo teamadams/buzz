@@ -85,7 +85,7 @@ run_unit_tests() {
     cargo test -p buzz-auth --lib -- --nocapture
 
   run_test_step "buzz-voice tests" \
-    cargo test -p buzz-voice --lib -- --nocapture
+    cargo test -p buzz-voice --all-targets -- --nocapture
 
   # buzz-db migrator/lint unit tests (no infra): guard the embedded-migrator
   # invariant (exactly the consolidated 0001; cutover/backfill stays an operator
