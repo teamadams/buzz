@@ -1,0 +1,715 @@
+//! Installation-global text-to-speech preferences and the local voice registry.
+//!
+//! Voice keys are backend-qualified (`pocket:mary`, `siri:aaron`) and
+//! preferences are ordered. A client resolves the first compatible entry for
+//! its one active playback backend. The same [`VoicePreferences`] value can be
+//! embedded in installation-global settings or future agent identity without a
+//! schema change. Availability is intentionally client-local.
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager, State};
+
+use crate::{app_state::AppState, managed_agents::storage::atomic_write_json_restricted};
+
+use super::{models, pocket::DEFAULT_VOICE, HuddlePhase};
+
+const SETTINGS_FILE: &str = "tts-settings.json";
+const CURRENT_VERSION: u32 = 1;
+pub const POCKET_BACKEND_ID: &str = "pocket";
+pub const MARY_VOICE_KEY: &str = "pocket:mary";
+pub const MARIUS_VOICE_KEY: &str = "pocket:marius";
+
+const VOICE_AVAILABILITY_BUNDLED: &str = "bundled";
+const VOICE_AVAILABILITY_INSTALLED: &str = "installed";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceRegistryEntry {
+    /// Stable identity, never derived from or merged by the display name.
+    ///
+    /// Built-ins use `backend:slug`. Future imports use
+    /// `pocket:imported:<audio-content-sha256>` so two clips with the same
+    /// editable label remain distinct.
+    pub key: String,
+    pub display_name: String,
+    pub backend: String,
+    pub backend_name: String,
+    /// Client-local state: bundled, installed, downloadable, or unavailable.
+    pub availability: String,
+    pub fallback_key: Option<String>,
+    pub reference_file: Option<String>,
+    pub provenance: VoiceProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceProvenance {
+    pub source: String,
+    pub content_hash: Option<String>,
+    pub license: Option<String>,
+    pub source_url: Option<String>,
+}
+
+/// Ordered, backend-qualified preferences shared by global and agent settings.
+///
+/// Unknown but well-formed keys remain persisted because a different client
+/// may have that backend installed. Resolution is always local.
+pub type VoicePreferences = Vec<String>;
+
+/// Cross-backend registry for voices known to this client.
+///
+/// V1 contains Pocket entries only. Siri, Kokoro, imported voices, and
+/// per-agent assignment can add entries or reuse the preference type without
+/// changing the registry/settings boundary.
+pub fn voice_registry() -> Vec<VoiceRegistryEntry> {
+    vec![
+        VoiceRegistryEntry {
+            key: MARY_VOICE_KEY.to_string(),
+            display_name: "Mary".to_string(),
+            backend: POCKET_BACKEND_ID.to_string(),
+            backend_name: "Pocket TTS".to_string(),
+            availability: VOICE_AVAILABILITY_BUNDLED.to_string(),
+            fallback_key: None,
+            reference_file: Some("reference_sample.wav".to_string()),
+            provenance: VoiceProvenance {
+                source: "bundled".to_string(),
+                content_hash: Some(
+                    "a35b0468382218e9f37a9a7494d1e4b74deaf18d7ced22265b4e325bb55c183f"
+                        .to_string(),
+                ),
+                license: Some("CC-BY-4.0".to_string()),
+                source_url: Some("https://datashare.ed.ac.uk/handle/10283/3443".to_string()),
+            },
+        },
+        VoiceRegistryEntry {
+            key: MARIUS_VOICE_KEY.to_string(),
+            display_name: "Marius".to_string(),
+            backend: POCKET_BACKEND_ID.to_string(),
+            backend_name: "Pocket TTS".to_string(),
+            availability: VOICE_AVAILABILITY_BUNDLED.to_string(),
+            fallback_key: Some(MARY_VOICE_KEY.to_string()),
+            reference_file: Some("marius.wav".to_string()),
+            provenance: VoiceProvenance {
+                source: "bundled".to_string(),
+                content_hash: Some(
+                    "076968c3122520f3412eb7090e8c1c3f75fe57be1e24a2f96465583d84c71e16"
+                        .to_string(),
+                ),
+                license: Some("CC0-1.0".to_string()),
+                source_url: Some(
+                    "https://huggingface.co/kyutai/tts-voices/blob/323332d33f997de8394f24a193e1a76df720e01a/voice-donations/Selfie.wav"
+                        .to_string(),
+                ),
+            },
+        },
+    ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TtsSettings {
+    pub version: u32,
+    pub agent_text_to_speech: bool,
+    pub voice_preferences: VoicePreferences,
+}
+
+impl Default for TtsSettings {
+    fn default() -> Self {
+        Self {
+            version: CURRENT_VERSION,
+            agent_text_to_speech: true,
+            voice_preferences: vec![MARY_VOICE_KEY.to_string()],
+        }
+    }
+}
+
+pub fn voice_by_key(key: &str) -> Option<VoiceRegistryEntry> {
+    voice_registry().into_iter().find(|voice| voice.key == key)
+}
+
+fn is_qualified_voice_key(key: &str) -> bool {
+    key.split_once(':')
+        .is_some_and(|(backend, voice)| !backend.is_empty() && !voice.is_empty())
+}
+
+fn is_locally_available(availability: &str) -> bool {
+    matches!(
+        availability,
+        VOICE_AVAILABILITY_BUNDLED | VOICE_AVAILABILITY_INSTALLED
+    )
+}
+
+pub fn resolve_voice_for_backend(
+    preferences: &[String],
+    backend: &str,
+) -> Result<VoiceRegistryEntry, String> {
+    let registry = voice_registry();
+    preferences
+        .iter()
+        .filter_map(|key| registry.iter().find(|voice| voice.key == *key))
+        .find(|voice| voice.backend == backend && is_locally_available(voice.availability.as_str()))
+        .or_else(|| {
+            registry.iter().find(|voice| {
+                voice.backend == backend
+                    && voice.fallback_key.is_none()
+                    && is_locally_available(voice.availability.as_str())
+            })
+        })
+        .cloned()
+        .ok_or_else(|| format!("No locally available fallback voice for backend {backend}"))
+}
+
+pub fn pocket_voice_name(preferences: &[String]) -> String {
+    resolve_voice_for_backend(preferences, POCKET_BACKEND_ID)
+        .ok()
+        .and_then(|voice| voice.reference_file)
+        .and_then(|file| file.strip_suffix(".wav").map(str::to_string))
+        .unwrap_or_else(|| DEFAULT_VOICE.to_string())
+}
+
+pub(crate) fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join(SETTINGS_FILE))
+        .map_err(|error| format!("could not locate Buzz settings storage: {error}"))
+}
+
+pub(crate) fn load_from_path(path: &Path) -> Result<TtsSettings, String> {
+    if !path.exists() {
+        return Ok(TtsSettings::default());
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("could not read text-to-speech settings: {error}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("text-to-speech settings are not valid JSON: {error}"))?;
+
+    // Pre-V1 experiment builds stored an unversioned, incompatible shape.
+    // Migrate it to deterministic V1 defaults instead of carrying it over.
+    if value.get("version").is_none() {
+        return Ok(TtsSettings::default());
+    }
+
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("text-to-speech settings version is invalid")?;
+    if version > u64::from(CURRENT_VERSION) {
+        return Err(format!(
+            "text-to-speech settings version {version} is newer than this Buzz build supports"
+        ));
+    }
+
+    // Early experiments used one bare Pocket `voiceId`. Preserve the toggle
+    // and qualify that value into the ordered cross-backend preference schema.
+    if value.get("voicePreferences").is_none() {
+        let legacy_voice = value
+            .get("voiceId")
+            .or_else(|| value.get("voice_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("mary");
+        let voice_key = if is_qualified_voice_key(legacy_voice) {
+            legacy_voice.to_string()
+        } else {
+            format!("{POCKET_BACKEND_ID}:{legacy_voice}")
+        };
+        return Ok(TtsSettings {
+            version: CURRENT_VERSION,
+            agent_text_to_speech: value
+                .get("agentTextToSpeech")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+            voice_preferences: vec![voice_key],
+        });
+    }
+
+    let mut settings: TtsSettings = serde_json::from_value(value)
+        .map_err(|error| format!("text-to-speech settings are invalid: {error}"))?;
+    settings.version = CURRENT_VERSION;
+    if settings.voice_preferences.is_empty()
+        || settings
+            .voice_preferences
+            .iter()
+            .any(|key| !is_qualified_voice_key(key))
+    {
+        settings.voice_preferences = TtsSettings::default().voice_preferences;
+    }
+    Ok(settings)
+}
+
+pub(crate) fn save_to_path(path: &Path, settings: &TtsSettings) -> Result<(), String> {
+    if settings.voice_preferences.is_empty() {
+        return Err("At least one voice preference is required".to_string());
+    }
+    if let Some(key) = settings
+        .voice_preferences
+        .iter()
+        .find(|key| !is_qualified_voice_key(key))
+    {
+        return Err(format!(
+            "Voice preference keys must be backend-qualified: {key}"
+        ));
+    }
+    let payload = serde_json::to_vec_pretty(settings)
+        .map_err(|error| format!("could not encode text-to-speech settings: {error}"))?;
+    atomic_write_json_restricted(path, &payload)
+        .map_err(|error| format!("could not save text-to-speech settings: {error}"))
+}
+
+pub fn load_for_app(app: &AppHandle) -> (TtsSettings, Option<String>) {
+    let result = settings_path(app).and_then(|path| load_from_path(&path));
+    match result {
+        Ok(settings) => (settings, None),
+        Err(error) => {
+            eprintln!("buzz-desktop: {error}; preserving the file and using Mary for this session");
+            (TtsSettings::default(), Some(error))
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_tts_settings(state: State<'_, AppState>) -> Result<TtsSettings, String> {
+    if let Some(error) = state
+        .tts_settings_load_error
+        .lock()
+        .map_err(|lock_error| format!("text-to-speech settings lock poisoned: {lock_error}"))?
+        .clone()
+    {
+        return Err(format!(
+            "Voice settings could not be loaded and were left unchanged: {error}"
+        ));
+    }
+    state
+        .tts_settings
+        .lock()
+        .map(|settings| settings.clone())
+        .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))
+}
+
+#[tauri::command]
+pub fn list_voice_registry() -> Vec<VoiceRegistryEntry> {
+    voice_registry()
+}
+
+fn ensure_settings_writable(state: &AppState) -> Result<(), String> {
+    if let Some(error) = state
+        .tts_settings_load_error
+        .lock()
+        .map_err(|lock_error| format!("text-to-speech settings lock poisoned: {lock_error}"))?
+        .as_ref()
+    {
+        return Err(format!(
+            "Voice settings were not saved because the existing file could not be loaded: {error}"
+        ));
+    }
+    Ok(())
+}
+
+fn cancel_huddle_speech(
+    huddle: &mut super::HuddleState,
+) -> Option<std::sync::Arc<super::tts::TtsPipeline>> {
+    huddle.tts_enabled = false;
+    huddle
+        .tts_cancel
+        .store(true, std::sync::atomic::Ordering::Release);
+    huddle.tts_pipeline.take()
+}
+
+fn disable_tts_runtime(state: &AppState) -> Result<(), String> {
+    let old_pipeline = {
+        let mut huddle = state.huddle()?;
+        cancel_huddle_speech(&mut huddle)
+    };
+    if let Some(ref pipeline) = old_pipeline {
+        pipeline.shutdown();
+    }
+    drop(old_pipeline);
+    state.emit_huddle_state_changed();
+    Ok(())
+}
+
+fn commit_effective_off(state: &AppState) -> Result<(), String> {
+    state
+        .tts_settings
+        .lock()
+        .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))?
+        .agent_text_to_speech = false;
+    Ok(())
+}
+
+async fn apply_tts_settings(
+    settings: TtsSettings,
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<TtsSettings, String> {
+    if settings.version != CURRENT_VERSION {
+        return Err(format!(
+            "Unsupported text-to-speech settings version: {}",
+            settings.version
+        ));
+    }
+
+    // OFF is safety-sensitive: stop current and queued speech before any disk
+    // I/O, and never resume it merely because persistence fails.
+    if !settings.agent_text_to_speech {
+        disable_tts_runtime(state)?;
+        commit_effective_off(state)?;
+    }
+
+    ensure_settings_writable(state)?;
+    save_to_path(&settings_path(app)?, &settings)?;
+
+    *state
+        .tts_settings
+        .lock()
+        .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))? =
+        settings.clone();
+
+    if settings.agent_text_to_speech {
+        let active = {
+            let mut huddle = state.huddle()?;
+            huddle.tts_enabled = true;
+            huddle
+                .tts_cancel
+                .store(false, std::sync::atomic::Ordering::Release);
+            if let Some(pipeline) = huddle.tts_pipeline.as_ref() {
+                pipeline.select_voice(&pocket_voice_name(&settings.voice_preferences));
+            }
+            matches!(huddle.phase, HuddlePhase::Connected | HuddlePhase::Active)
+        };
+        if active {
+            if let Err(error) = super::pipeline::maybe_start_tts_pipeline(state).await {
+                eprintln!("buzz-desktop: could not hot-start text to speech: {error}");
+            }
+        }
+        state.emit_huddle_state_changed();
+    }
+    Ok(settings)
+}
+
+/// Compatibility command for the huddle speaker button. It updates the same
+/// installation-global preference as Settings; there is no per-huddle override.
+#[tauri::command]
+pub async fn set_tts_enabled(
+    enabled: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<TtsSettings, String> {
+    let _transition = state.tts_settings_transition.lock().await;
+    let mut settings = state
+        .tts_settings
+        .lock()
+        .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))?
+        .clone();
+    settings.agent_text_to_speech = enabled;
+    apply_tts_settings(settings, &app, &state).await
+}
+
+fn settings_with_pocket_voice(
+    mut settings: TtsSettings,
+    voice_key: &str,
+) -> Result<TtsSettings, String> {
+    let voice = voice_by_key(voice_key).ok_or_else(|| format!("Unknown voice: {voice_key}"))?;
+    if voice.backend != POCKET_BACKEND_ID || !is_locally_available(&voice.availability) {
+        return Err("The selected Pocket voice is not available on this device".to_string());
+    }
+    let first_pocket_index = settings
+        .voice_preferences
+        .iter()
+        .position(|key| key.starts_with("pocket:"));
+    settings
+        .voice_preferences
+        .retain(|key| !key.starts_with("pocket:"));
+    let insert_at = first_pocket_index
+        .unwrap_or(settings.voice_preferences.len())
+        .min(settings.voice_preferences.len());
+    settings
+        .voice_preferences
+        .insert(insert_at, voice_key.to_string());
+    Ok(settings)
+}
+
+#[tauri::command]
+pub async fn set_pocket_voice(
+    voice_key: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<TtsSettings, String> {
+    let _transition = state.tts_settings_transition.lock().await;
+    let settings = state
+        .tts_settings
+        .lock()
+        .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))?
+        .clone();
+    let settings = settings_with_pocket_voice(settings, &voice_key)?;
+    apply_tts_settings(settings, &app, &state).await
+}
+
+#[tauri::command]
+pub async fn preview_pocket_voice(
+    voice_key: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let voice = voice_by_key(&voice_key).ok_or_else(|| format!("Unknown voice: {voice_key}"))?;
+    if voice.backend != POCKET_BACKEND_ID {
+        return Err("Only Pocket voices can be previewed in this build".to_string());
+    }
+    if !models::is_tts_ready() {
+        return Err("Voice files are still downloading. Try preview again shortly.".to_string());
+    }
+    let model_dir = models::tts_model_dir().ok_or("Pocket voice files are unavailable")?;
+    let output_device = state
+        .audio_output_device
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let voice_name = voice
+        .reference_file
+        .and_then(|file| file.strip_suffix(".wav").map(str::to_string))
+        .ok_or_else(|| format!("Voice {voice_key} has no local Pocket reference file"))?;
+    tokio::task::spawn_blocking(move || {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipeline = super::tts::TtsPipeline::new_with_voice(
+            model_dir,
+            active.clone(),
+            cancel,
+            &voice_name,
+            output_device,
+        )?;
+        pipeline.speak("Hello! This is how I’ll read agent responses.".to_string())?;
+        let started = std::time::Instant::now();
+        let mut heard_audio = false;
+        while started.elapsed() < std::time::Duration::from_secs(30) {
+            let is_active = active.load(std::sync::atomic::Ordering::Acquire);
+            heard_audio |= is_active;
+            if heard_audio && !is_active {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        Err("Voice preview timed out. Check your audio output and try again.".to_string())
+    })
+    .await
+    .map_err(|error| format!("Voice preview task failed: {error}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_backwards_compatible_and_use_mary() {
+        assert_eq!(
+            TtsSettings::default(),
+            TtsSettings {
+                version: 1,
+                agent_text_to_speech: true,
+                voice_preferences: vec!["pocket:mary".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn v1_registry_has_exactly_the_two_reviewed_bundled_voices() {
+        assert_eq!(
+            voice_registry()
+                .iter()
+                .map(|voice| {
+                    (
+                        voice.key.as_str(),
+                        voice.display_name.as_str(),
+                        voice.reference_file.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("pocket:mary", "Mary", Some("reference_sample.wav")),
+                ("pocket:marius", "Marius", Some("marius.wav")),
+            ]
+        );
+    }
+
+    #[test]
+    fn local_backend_resolution_uses_first_compatible_preference() {
+        let preferences = vec![
+            "siri:aaron".to_string(),
+            MARIUS_VOICE_KEY.to_string(),
+            MARY_VOICE_KEY.to_string(),
+            "kokoro:af_heart".to_string(),
+        ];
+        assert_eq!(
+            resolve_voice_for_backend(&preferences, POCKET_BACKEND_ID)
+                .expect("Pocket fallback")
+                .key,
+            MARIUS_VOICE_KEY
+        );
+    }
+
+    #[test]
+    fn unsupported_or_missing_preferences_fall_back_to_backend_default() {
+        let preferences = vec![
+            "siri:aaron".to_string(),
+            "pocket:imported:deadbeef".to_string(),
+        ];
+        assert_eq!(
+            resolve_voice_for_backend(&preferences, POCKET_BACKEND_ID)
+                .expect("Pocket fallback")
+                .key,
+            MARY_VOICE_KEY
+        );
+    }
+
+    #[test]
+    fn identity_is_qualified_key_not_display_label() {
+        assert!(is_qualified_voice_key("pocket:imported:audio-content-hash"));
+        assert_ne!(MARY_VOICE_KEY, MARIUS_VOICE_KEY);
+        let mut registry = voice_registry();
+        registry[0].display_name = "Jim".to_string();
+        registry[1].display_name = "Jim".to_string();
+        assert_eq!(registry[0].display_name, registry[1].display_name);
+        assert_ne!(registry[0].key, registry[1].key);
+        assert_eq!(
+            registry
+                .iter()
+                .map(|voice| voice.key.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            registry.len()
+        );
+    }
+
+    #[test]
+    fn bundled_marius_asset_has_reviewed_size_and_wav_container() {
+        let bytes = include_bytes!("../../resources/pocket-voices/marius.wav");
+        assert_eq!(bytes.len(), 480_044);
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes)),
+            "076968c3122520f3412eb7090e8c1c3f75fe57be1e24a2f96465583d84c71e16"
+        );
+    }
+
+    #[test]
+    fn migrates_unversioned_experiment_settings_to_v1_defaults() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(SETTINGS_FILE);
+        std::fs::write(&path, r#"{"voice":"legacy-experiment"}"#).expect("fixture write");
+        assert_eq!(
+            load_from_path(&path).expect("migration"),
+            TtsSettings::default()
+        );
+    }
+
+    #[test]
+    fn migrates_bare_pocket_voice_id_to_qualified_preferences() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(SETTINGS_FILE);
+        std::fs::write(
+            &path,
+            r#"{"version":1,"agentTextToSpeech":false,"voiceId":"marius"}"#,
+        )
+        .expect("fixture write");
+        assert_eq!(
+            load_from_path(&path).expect("migration"),
+            TtsSettings {
+                version: 1,
+                agent_text_to_speech: false,
+                voice_preferences: vec![MARIUS_VOICE_KEY.to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_qualified_preferences_are_preserved_for_other_clients() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(SETTINGS_FILE);
+        std::fs::write(
+            &path,
+            r#"{"version":1,"agentTextToSpeech":false,"voicePreferences":["siri:aaron","pocket:imported:abc123"]}"#,
+        )
+        .expect("fixture write");
+        let settings = load_from_path(&path).expect("load");
+        assert!(!settings.agent_text_to_speech);
+        assert_eq!(
+            settings.voice_preferences,
+            vec!["siri:aaron", "pocket:imported:abc123"]
+        );
+    }
+
+    #[test]
+    fn rejects_future_schema_versions_clearly() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(SETTINGS_FILE);
+        std::fs::write(
+            &path,
+            r#"{"version":99,"agentTextToSpeech":true,"voicePreferences":["pocket:mary"]}"#,
+        )
+        .expect("fixture write");
+        assert!(load_from_path(&path)
+            .expect_err("future version should fail")
+            .contains("newer than this Buzz build supports"));
+    }
+
+    #[test]
+    fn disabling_cancels_runtime_before_persistence_can_fail() {
+        let mut huddle = super::super::HuddleState {
+            tts_enabled: true,
+            ..super::super::HuddleState::default()
+        };
+        assert!(!huddle.tts_cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(cancel_huddle_speech(&mut huddle).is_none());
+        assert!(!huddle.tts_enabled);
+        assert!(huddle.tts_cancel.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn pocket_voice_update_preserves_the_latest_toggle_and_other_backends() {
+        let current = TtsSettings {
+            agent_text_to_speech: false,
+            voice_preferences: vec!["siri:aaron".to_string(), MARY_VOICE_KEY.to_string()],
+            ..TtsSettings::default()
+        };
+        let updated =
+            settings_with_pocket_voice(current, MARIUS_VOICE_KEY).expect("available voice");
+        assert!(!updated.agent_text_to_speech);
+        assert_eq!(
+            updated.voice_preferences,
+            vec!["siri:aaron", MARIUS_VOICE_KEY]
+        );
+    }
+
+    #[test]
+    fn failed_off_persistence_cannot_be_undone_by_a_later_voice_update() {
+        let state = crate::app_state::build_app_state();
+        commit_effective_off(&state).expect("commit effective OFF state");
+
+        // This models the next command after the OFF save fails: it must merge
+        // from effective memory state, not the stale last-persisted ON value.
+        let current = state.tts_settings.lock().expect("settings").clone();
+        let voice_update =
+            settings_with_pocket_voice(current, MARIUS_VOICE_KEY).expect("available voice");
+        assert!(!voice_update.agent_text_to_speech);
+    }
+
+    #[test]
+    fn failed_disabled_voice_save_does_not_change_the_remembered_voice() {
+        let state = crate::app_state::build_app_state();
+        state
+            .tts_settings
+            .lock()
+            .expect("settings")
+            .agent_text_to_speech = false;
+        let current = state.tts_settings.lock().expect("settings").clone();
+        let unsaved =
+            settings_with_pocket_voice(current, MARIUS_VOICE_KEY).expect("available voice");
+
+        // This is the only pre-persistence mutation for an OFF candidate.
+        commit_effective_off(&state).expect("commit effective OFF state");
+        let remembered = state.tts_settings.lock().expect("settings").clone();
+        assert_eq!(remembered.voice_preferences, vec![MARY_VOICE_KEY]);
+        assert_eq!(unsaved.voice_preferences, vec![MARIUS_VOICE_KEY]);
+    }
+}

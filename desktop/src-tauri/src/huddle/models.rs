@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[path = "models_voice_upgrade.rs"]
+mod voice_upgrade;
+
 // ── Integrity verification ────────────────────────────────────────────────────
 //
 // All model artifacts are verified against pinned SHA-256 hashes before
@@ -77,6 +80,7 @@ const TTS_FILE_HASHES: &[(&str, &str)] = &[
     ("token_scores.json",     "5be2f278caf9b9800741f0fd82bff677f4943ec764c356f907213434b622d958"),
     ("LICENSE",               "fe7b4ce83b8381cc5b216bbb4af73c570688d1b819c73bbaed8ca401f4677cd6"),
     ("reference_sample.wav",  "a35b0468382218e9f37a9a7494d1e4b74deaf18d7ced22265b4e325bb55c183f"),
+    ("marius.wav",            "076968c3122520f3412eb7090e8c1c3f75fe57be1e24a2f96465583d84c71e16"),
 ];
 
 // ── Model versioning ──────────────────────────────────────────────────────────
@@ -100,7 +104,7 @@ const STT_MODEL_VERSION: &str = "2";
 /// reason explicit and skips the failing-then-re-fetching transient state.
 /// Bumped "2" → "3" for the int8 → fp32 model swap (see `POCKET_HF_BASE`):
 /// existing int8 installs must re-download the suffixless fp32 sessions.
-const TTS_MODEL_VERSION: &str = "3";
+const TTS_MODEL_VERSION: &str = "4";
 
 /// Filename for the version manifest written alongside model files.
 const MANIFEST_FILENAME: &str = ".buzz-model-manifest";
@@ -194,6 +198,14 @@ https://datashare.ed.ac.uk/handle/10283/3443 (CC-BY-4.0).
 Recording enhancement (denoise/dereverb) by ai-coustics:
 https://ai-coustics.com/
 
+Bundled reference voice (marius.wav):
+\"Marius\", an audio-identical copy of Kyutai's
+`voice-donations/Selfie.wav`, distributed under CC0 1.0 Universal:
+https://huggingface.co/kyutai/tts-voices/blob/main/voice-donations/Selfie.wav
+https://creativecommons.org/publicdomain/zero/1.0/
+The contributor submitted their own voice under Kyutai's Unmute Voice Donation
+Project terms. Neither Kyutai nor the contributor endorses Buzz.
+
 Buzz ships all ONNX/model artifacts and the reference voice WAV unmodified,
 renamed only by placement in the local model directory.
 
@@ -212,6 +224,7 @@ const TTS_EXPECTED_FILES: &[&str] = &[
     "token_scores.json",
     "LICENSE",
     "reference_sample.wav",
+    "marius.wav",
     TTS_LICENSE_FILE_NAME,
 ];
 
@@ -640,6 +653,9 @@ impl ModelManager {
 
     /// Start a background Pocket TTS download (~189 MB). No-op if already ready or downloading.
     pub fn start_tts_download(&self, http_client: reqwest::Client) {
+        if let Err(error) = voice_upgrade::install_marius_into_v3_model(&self.models_dir) {
+            eprintln!("buzz-desktop: could not upgrade existing Pocket voices in place: {error}");
+        }
         let manager = self.clone();
         self.tts.start_download(
             &self.models_dir,
@@ -757,7 +773,7 @@ impl ModelManager {
     ///   - five ONNX sessions (Pocket TTS + Mimi codec)
     ///   - `vocab.json` / `token_scores.json` for sherpa-onnx text conditioning
     ///   - upstream `LICENSE` plus Buzz's `MODEL_LICENSE.txt` attribution sidecar
-    ///   - `reference_sample.wav` as the bundled default voice
+    ///   - `reference_sample.wav` and embedded `marius.wav` reference voices
     ///
     /// Files are written to a temp directory first, then moved atomically.
     async fn download_tts_model(&self, http_client: reqwest::Client) -> Result<(), String> {
@@ -845,6 +861,12 @@ impl ModelManager {
         tokio::fs::write(temp_dir.join(TTS_LICENSE_FILE_NAME), TTS_LICENSE_TEXT)
             .await
             .map_err(|e| format!("write TTS model license sidecar: {e}"))?;
+        tokio::fs::write(
+            temp_dir.join("marius.wav"),
+            voice_upgrade::POCKET_MARIUS_WAV,
+        )
+        .await
+        .map_err(|e| format!("install bundled Marius voice: {e}"))?;
 
         self.tts.set_status(ModelStatus::Downloading {
             progress_percent: 90,

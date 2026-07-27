@@ -128,6 +128,11 @@ export type MockAgentMemoryListing = {
 };
 
 type MockBridgeOptions = {
+  ttsSettings?: {
+    version: number;
+    agentTextToSpeech: boolean;
+    voicePreferences: string[];
+  };
   /** Advertised HEAD for the first mock project without adding that branch. */
   projectHeadBranch?: string;
   /** Relay NIP-11 identity used to sign authoritative repository state. */

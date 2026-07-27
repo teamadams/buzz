@@ -132,38 +132,18 @@ pub struct TtsPipeline {
     /// Kept alive here so the Arc isn't dropped — the worker holds a clone.
     #[allow(dead_code)]
     cancel: Arc<AtomicBool>,
-    /// Voice name (e.g. "reference_sample"). Stored for future voice-switching support.
-    #[allow(dead_code)]
-    voice: String,
+    /// Selected manifest voice. The worker reloads only the lightweight style
+    /// when this changes; the warmed Pocket engine and audio player stay alive.
+    voice: Arc<Mutex<String>>,
     /// Worker thread handle — taken on drop to join cleanly.
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl TtsPipeline {
-    /// Spawn the TTS pipeline thread using the default voice.
+    /// Spawn the TTS pipeline thread with a manifest-backed voice name.
     ///
-    /// `model_dir` must contain the Pocket TTS files declared by `huddle::models`
-    /// (the five ONNX sessions, the two JSON tables, and `<voice>.wav`).
-    ///
-    /// `tts_active` is set to `true` while audio is playing and `false` when idle.
-    /// Pass the same `Arc` to the STT pipeline to gate microphone input.
-    ///
-    /// `cancel` is the shared barge-in flag from `HuddleState.tts_cancel`. Pass the
-    /// same `Arc` to the STT pipeline so both sides reference the same flag for the
-    /// entire huddle session — no stale references after pipeline restarts.
-    pub fn new(
-        model_dir: PathBuf,
-        tts_active: Arc<AtomicBool>,
-        cancel: Arc<AtomicBool>,
-        output_device: Option<String>,
-    ) -> Result<Self, String> {
-        use super::pocket::DEFAULT_VOICE;
-        Self::new_with_voice(model_dir, tts_active, cancel, DEFAULT_VOICE, output_device)
-    }
-
-    /// Spawn the TTS pipeline thread with a specific voice name. Today only the
-    /// bundled default voice (see `pocket::DEFAULT_VOICE`) is shipped; other
-    /// names will surface a clear error from `load_voice_style`.
+    /// `cancel` is shared with STT for barge-in. The same handle survives voice
+    /// changes so the warmed Pocket engine is retained.
     pub fn new_with_voice(
         model_dir: PathBuf,
         tts_active: Arc<AtomicBool>,
@@ -178,7 +158,8 @@ impl TtsPipeline {
         let shutdown_worker = Arc::clone(&shutdown);
         let cancel_worker = Arc::clone(&cancel);
         let tts_active_worker = Arc::clone(&tts_active);
-        let voice_name = voice.to_string();
+        let voice = Arc::new(Mutex::new(voice.to_string()));
+        let voice_worker = Arc::clone(&voice);
         let model_dir_worker = model_dir.clone();
 
         let handle = thread::Builder::new()
@@ -186,7 +167,7 @@ impl TtsPipeline {
             .spawn(move || {
                 tts_worker(
                     model_dir_worker,
-                    voice_name,
+                    voice_worker,
                     text_rx,
                     tts_active_worker,
                     shutdown_worker,
@@ -201,7 +182,7 @@ impl TtsPipeline {
             tts_active,
             shutdown,
             cancel,
-            voice: voice.to_string(),
+            voice,
             thread: Some(handle),
         })
     }
@@ -215,6 +196,23 @@ impl TtsPipeline {
             eprintln!("buzz-desktop: TTS queue saturated, dropping message: {e}");
             format!("TTS queue full, dropping: {e}")
         })
+    }
+
+    /// Clone the bounded queue sender so callers can apply backpressure without
+    /// holding the huddle mutex. Disabling TTS drops the receiver and unblocks
+    /// any waiting sender while the shared cancellation flag stops playback.
+    pub(crate) fn text_sender(&self) -> SyncSender<String> {
+        self.text_tx.clone()
+    }
+
+    /// Select a bundled Pocket voice for subsequent speech.
+    ///
+    /// Current playback and queued text are cancelled immediately so content
+    /// cannot continue in the old voice. The worker keeps its warmed inference
+    /// engine and reloads only the reference style before the next utterance.
+    pub fn select_voice(&self, voice: &str) {
+        *self.voice.lock().unwrap_or_else(|error| error.into_inner()) = voice.to_string();
+        self.cancel.store(true, Ordering::Release);
     }
 
     /// Signal the worker thread to stop.
@@ -244,7 +242,7 @@ impl Drop for TtsPipeline {
 
 fn tts_worker(
     model_dir: PathBuf,
-    voice_name: String,
+    selected_voice: Arc<Mutex<String>>,
     text_rx: mpsc::Receiver<String>,
     tts_active: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -267,8 +265,12 @@ fn tts_worker(
     };
 
     // ── 2. Load voice style ───────────────────────────────────────────────────
+    let mut voice_name = selected_voice
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
     let voice_path = model_dir.join(format!("{voice_name}.{VOICE_FILE_EXT}"));
-    let style = match load_voice_style(&voice_path) {
+    let mut style = match load_voice_style(&voice_path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
@@ -439,6 +441,46 @@ fn tts_worker(
             // append starts a new utterance and needs its own lead-in cushion.
             first_append = true;
             continue;
+        }
+
+        // Voice changes cancel the old utterance/queue and are observed here,
+        // before receiving subsequent text. A bad bundled asset falls back to
+        // Mary without discarding the already-warmed Pocket engine.
+        let requested_voice = selected_voice
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if requested_voice != voice_name {
+            let requested_path = model_dir.join(format!("{requested_voice}.{VOICE_FILE_EXT}"));
+            match load_voice_style(&requested_path) {
+                Ok(requested_style) => {
+                    style = requested_style;
+                    voice_name = requested_voice;
+                }
+                Err(error) => {
+                    use super::pocket::DEFAULT_VOICE;
+                    eprintln!(
+                        "buzz-desktop: Pocket voice {requested_voice} is unavailable ({error}); falling back to Mary"
+                    );
+                    let fallback_path = model_dir.join(format!("{DEFAULT_VOICE}.{VOICE_FILE_EXT}"));
+                    match load_voice_style(&fallback_path) {
+                        Ok(fallback_style) => {
+                            style = fallback_style;
+                            voice_name = DEFAULT_VOICE.to_string();
+                            *selected_voice
+                                .lock()
+                                .unwrap_or_else(|lock_error| lock_error.into_inner()) =
+                                DEFAULT_VOICE.to_string();
+                        }
+                        Err(fallback_error) => {
+                            eprintln!(
+                                "buzz-desktop: Mary voice fallback is unavailable: {fallback_error}"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
         }
 
         let raw_text = match text_rx.recv_timeout(RECV_TIMEOUT) {
@@ -776,3 +818,6 @@ use super::drain_until_shutdown;
 #[cfg(test)]
 #[path = "tts_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "tts_voice_selection_tests.rs"]
+mod voice_selection_tests;

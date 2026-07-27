@@ -141,6 +141,11 @@ type MockSearchProfileSeed = {
 type E2eConfig = {
   mode?: "mock" | "relay";
   mock?: {
+    ttsSettings?: {
+      version: number;
+      agentTextToSpeech: boolean;
+      voicePreferences: string[];
+    };
     /** Advertised HEAD for the first mock project without adding that branch. */
     projectHeadBranch?: string;
     /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
@@ -9430,6 +9435,88 @@ export function maybeInstallE2eTauriMocks() {
     window.__BUZZ_E2E_COMMAND_LOG__?.push({ command, payload });
 
     switch (command) {
+      case "get_tts_settings":
+        return (
+          activeConfig?.mock?.ttsSettings ?? {
+            version: 1,
+            agentTextToSpeech: true,
+            voicePreferences: ["pocket:mary"],
+          }
+        );
+      case "list_voice_registry":
+        return [
+          {
+            key: "pocket:mary",
+            displayName: "Mary",
+            backend: "pocket",
+            backendName: "Pocket TTS",
+            availability: "bundled",
+            fallbackKey: null,
+            referenceFile: "reference_sample.wav",
+            provenance: {
+              source: "bundled",
+              contentHash:
+                "a35b0468382218e9f37a9a7494d1e4b74deaf18d7ced22265b4e325bb55c183f",
+              license: "CC-BY-4.0",
+              sourceUrl: "https://datashare.ed.ac.uk/handle/10283/3443",
+            },
+          },
+          {
+            key: "pocket:marius",
+            displayName: "Marius",
+            backend: "pocket",
+            backendName: "Pocket TTS",
+            availability: "bundled",
+            fallbackKey: "pocket:mary",
+            referenceFile: "marius.wav",
+            provenance: {
+              source: "bundled",
+              contentHash:
+                "076968c3122520f3412eb7090e8c1c3f75fe57be1e24a2f96465583d84c71e16",
+              license: "CC0-1.0",
+              sourceUrl:
+                "https://huggingface.co/kyutai/tts-voices/blob/323332d33f997de8394f24a193e1a76df720e01a/voice-donations/Selfie.wav",
+            },
+          },
+        ];
+      case "set_tts_enabled": {
+        const enabled = (payload as { enabled?: boolean })?.enabled;
+        if (typeof enabled !== "boolean")
+          throw new Error("Missing text-to-speech enabled state");
+        const settings = {
+          version: 1,
+          agentTextToSpeech: enabled,
+          voicePreferences: activeConfig?.mock?.ttsSettings
+            ?.voicePreferences ?? ["pocket:mary"],
+        };
+        if (activeConfig?.mock) activeConfig.mock.ttsSettings = settings;
+        return settings;
+      }
+      case "set_pocket_voice": {
+        const voiceKey = (payload as { voiceKey?: string })?.voiceKey;
+        if (!voiceKey) throw new Error("Missing Pocket voice key");
+        const current = activeConfig?.mock?.ttsSettings ?? {
+          version: 1,
+          agentTextToSpeech: true,
+          voicePreferences: ["pocket:mary"],
+        };
+        const firstPocketIndex = current.voicePreferences.findIndex((key) =>
+          key.startsWith("pocket:"),
+        );
+        const preferences = current.voicePreferences.filter(
+          (key) => !key.startsWith("pocket:"),
+        );
+        preferences.splice(
+          firstPocketIndex < 0 ? preferences.length : firstPocketIndex,
+          0,
+          voiceKey,
+        );
+        const settings = { ...current, voicePreferences: preferences };
+        if (activeConfig?.mock) activeConfig.mock.ttsSettings = settings;
+        return settings;
+      }
+      case "preview_pocket_voice":
+        return null;
       case "get_builderlab_auth":
         return activeConfig?.mock?.builderlabAuth ?? null;
       case "start_builderlab_login": {

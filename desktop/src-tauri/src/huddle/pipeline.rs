@@ -216,8 +216,15 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let voice = state
+        .tts_settings
+        .lock()
+        .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))
+        .map(|settings| {
+            super::tts_settings::pocket_voice_name(&settings.voice_preferences).to_string()
+        })?;
     let constructed = tokio::task::spawn_blocking(move || {
-        tts::TtsPipeline::new(model_dir, tts_active, tts_cancel, output_device)
+        tts::TtsPipeline::new_with_voice(model_dir, tts_active, tts_cancel, &voice, output_device)
     })
     .await;
     let pipeline = match constructed {

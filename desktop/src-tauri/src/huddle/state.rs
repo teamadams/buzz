@@ -202,8 +202,10 @@ impl HuddleState {
     /// to invalidate in-flight transcription tasks without losing the generation.
     pub(crate) fn reset_preserving_generation(&mut self) {
         let gen = Arc::clone(&self.session_generation);
+        let tts_enabled = self.tts_enabled;
         *self = Self::default();
         self.session_generation = gen;
+        self.tts_enabled = tts_enabled;
     }
 }
 
@@ -232,4 +234,21 @@ pub fn emit_huddle_state(app: &tauri::AppHandle, state: &HuddleState) {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HuddleJoinInfo {
     pub ephemeral_channel_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn teardown_preserves_installation_global_tts_preference() {
+        let mut state = HuddleState {
+            tts_enabled: false,
+            phase: HuddlePhase::Active,
+            ..HuddleState::default()
+        };
+        state.reset_preserving_generation();
+        assert!(!state.tts_enabled);
+        assert_eq!(state.phase, HuddlePhase::Idle);
+    }
 }
