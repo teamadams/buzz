@@ -2798,6 +2798,7 @@ let mockClosedChannelLiveSubscription = false;
 const realSockets = new Map<number, WebSocket>();
 let mockManagedAgents: MockManagedAgent[] = [];
 let mockManagedAgentRuntimes: MockManagedAgentRuntimeRow[] = [];
+let mockTtsPlaybackSpeed = 1;
 
 // Mutable `save_subscriptions` table mirror — TEST-ONLY.
 //
@@ -9522,6 +9523,11 @@ export function maybeInstallE2eTauriMocks() {
         return settings;
       }
       case "preview_pocket_voice":
+        return null;
+      case "get_tts_playback_speed":
+        return mockTtsPlaybackSpeed;
+      case "set_tts_playback_speed":
+        mockTtsPlaybackSpeed = (payload as { speed: number }).speed;
         return null;
       case "get_builderlab_auth":
         return activeConfig?.mock?.builderlabAuth ?? null;
