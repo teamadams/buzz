@@ -600,6 +600,7 @@ mod tests {
                 Arc::clone(&cancel),
                 "reference_sample",
                 None,
+                super::super::playback_speed::PlaybackSpeedControl::default(),
             )
             .expect("pipeline"),
         );

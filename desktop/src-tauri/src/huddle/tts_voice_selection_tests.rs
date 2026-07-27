@@ -42,6 +42,7 @@ fn reconciling_an_unpublished_pipeline_does_not_cancel_its_first_message() {
         Arc::clone(&cancel),
         "reference_sample",
         None,
+        PlaybackSpeedControl::default(),
     )
     .expect("pipeline handle");
 
