@@ -54,11 +54,9 @@ pub struct AppState {
     /// Tauri app handle — stored after setup so huddle commands can emit
     /// `huddle-state-changed` events without needing the handle threaded
     /// through every call site.
-    ///
     /// Set once during `setup()` in `lib.rs`; never cleared.
     pub app_handle: Mutex<Option<AppHandle>>,
-    /// Selected audio output device name. `None` = system default.
-    /// Used by `connect_audio_relay` and TTS pipeline when opening sinks.
+    /// Selected audio output device (`None` uses the system default) for relay and TTS.
     pub audio_output_device: Mutex<Option<String>>,
     pub tts_playback_speed: crate::huddle::playback_speed::PlaybackSpeedControl,
     /// Port of the localhost media streaming proxy (set during setup).
