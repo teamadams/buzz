@@ -941,6 +941,9 @@ fn group_sentences_into_chunks(sentences: &[String], max_chars: usize) -> Vec<St
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[path = "tts_playback_speed_tests.rs"]
+mod playback_speed_tests;
+#[cfg(test)]
 #[path = "tts_tests.rs"]
 mod tests;
 #[cfg(test)]
