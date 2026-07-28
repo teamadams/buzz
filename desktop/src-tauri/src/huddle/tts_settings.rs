@@ -73,7 +73,7 @@ pub type VoicePreferences = Vec<String>;
 /// V1 contains Pocket entries only. Siri, Kokoro, imported voices, and
 /// per-agent assignment can add entries or reuse the preference type without
 /// changing the registry/settings boundary.
-pub fn voice_registry() -> Vec<VoiceRegistryEntry> {
+pub fn bundled_voice_registry() -> Vec<VoiceRegistryEntry> {
     vec![
         VoiceRegistryEntry {
             key: MARY_VOICE_KEY.to_string(),
@@ -117,6 +117,33 @@ pub fn voice_registry() -> Vec<VoiceRegistryEntry> {
     ]
 }
 
+pub fn voice_registry(app: &AppHandle) -> Vec<VoiceRegistryEntry> {
+    let mut registry = bundled_voice_registry();
+    match super::tts_voice_import::load_registry(app) {
+        Ok(imported) => registry.extend(imported.into_iter().map(|voice| VoiceRegistryEntry {
+            key: voice.key,
+            display_name: voice.display_name,
+            backend: POCKET_BACKEND_ID.to_string(),
+            backend_name: "Pocket TTS".to_string(),
+            availability: VOICE_AVAILABILITY_INSTALLED.to_string(),
+            fallback_key: Some(MARY_VOICE_KEY.to_string()),
+            reference_file: Some(voice.file_name),
+            provenance: VoiceProvenance {
+                source: "local import".to_string(),
+                content_hash: Some(voice.content_hash),
+                license: None,
+                source_url: None,
+            },
+        })),
+        Err(error) => {
+            eprintln!(
+                "buzz-desktop: {error}; imported Pocket voices are unavailable for this session"
+            );
+        }
+    }
+    registry
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TtsSettings {
@@ -135,8 +162,10 @@ impl Default for TtsSettings {
     }
 }
 
-pub fn voice_by_key(key: &str) -> Option<VoiceRegistryEntry> {
-    voice_registry().into_iter().find(|voice| voice.key == key)
+pub fn voice_by_key(app: &AppHandle, key: &str) -> Option<VoiceRegistryEntry> {
+    voice_registry(app)
+        .into_iter()
+        .find(|voice| voice.key == key)
 }
 
 fn is_qualified_voice_key(key: &str) -> bool {
@@ -151,11 +180,19 @@ fn is_locally_available(availability: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub fn resolve_voice_for_backend(
     preferences: &[String],
     backend: &str,
 ) -> Result<VoiceRegistryEntry, String> {
-    let registry = voice_registry();
+    resolve_voice_for_backend_in_registry(preferences, backend, &bundled_voice_registry())
+}
+
+fn resolve_voice_for_backend_in_registry(
+    preferences: &[String],
+    backend: &str,
+    registry: &[VoiceRegistryEntry],
+) -> Result<VoiceRegistryEntry, String> {
     preferences
         .iter()
         .filter_map(|key| registry.iter().find(|voice| voice.key == *key))
@@ -171,12 +208,29 @@ pub fn resolve_voice_for_backend(
         .ok_or_else(|| format!("No locally available fallback voice for backend {backend}"))
 }
 
-pub fn pocket_voice_name(preferences: &[String]) -> String {
-    resolve_voice_for_backend(preferences, POCKET_BACKEND_ID)
+pub fn bundled_pocket_voice_reference(preferences: &[String]) -> String {
+    resolve_voice_for_backend_in_registry(preferences, POCKET_BACKEND_ID, &bundled_voice_registry())
         .ok()
         .and_then(|voice| voice.reference_file)
         .and_then(|file| file.strip_suffix(".wav").map(str::to_string))
         .unwrap_or_else(|| DEFAULT_VOICE.to_string())
+}
+
+pub fn pocket_voice_reference(app: &AppHandle, preferences: &[String]) -> Result<String, String> {
+    let registry = voice_registry(app);
+    let voice = resolve_voice_for_backend_in_registry(preferences, POCKET_BACKEND_ID, &registry)?;
+    if voice.key.starts_with("pocket:imported:") {
+        let imported = super::tts_voice_import::load_registry(app)?
+            .into_iter()
+            .find(|candidate| candidate.key == voice.key)
+            .ok_or_else(|| format!("Imported voice {} is unavailable", voice.display_name))?;
+        return super::tts_voice_import::resolve_file(app, &imported)
+            .map(|path| path.to_string_lossy().into_owned());
+    }
+    Ok(voice
+        .reference_file
+        .and_then(|file| file.strip_suffix(".wav").map(str::to_string))
+        .unwrap_or_else(|| DEFAULT_VOICE.to_string()))
 }
 
 pub(crate) fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -298,8 +352,8 @@ pub fn get_tts_settings(state: State<'_, AppState>) -> Result<TtsSettings, Strin
 }
 
 #[tauri::command]
-pub fn list_voice_registry() -> Vec<VoiceRegistryEntry> {
-    voice_registry()
+pub fn list_voice_registry(app: AppHandle) -> Vec<VoiceRegistryEntry> {
+    voice_registry(&app)
 }
 
 fn ensure_settings_writable(state: &AppState) -> Result<(), String> {
@@ -397,8 +451,8 @@ async fn apply_tts_settings(
     if settings.agent_text_to_speech {
         let (active, voice_change_ack) = {
             let mut huddle = state.huddle()?;
-            let voice_change_ack =
-                enable_tts_runtime(&mut huddle, &pocket_voice_name(&settings.voice_preferences));
+            let voice_reference = pocket_voice_reference(app, &settings.voice_preferences)?;
+            let voice_change_ack = enable_tts_runtime(&mut huddle, &voice_reference);
             (
                 matches!(huddle.phase, HuddlePhase::Connected | HuddlePhase::Active),
                 voice_change_ack,
@@ -480,10 +534,22 @@ pub async fn set_tts_enabled(
 }
 
 fn settings_with_pocket_voice(
+    settings: TtsSettings,
+    voice_key: &str,
+    app: &AppHandle,
+) -> Result<TtsSettings, String> {
+    settings_with_pocket_voice_from_registry(settings, voice_key, &voice_registry(app))
+}
+
+fn settings_with_pocket_voice_from_registry(
     mut settings: TtsSettings,
     voice_key: &str,
+    registry: &[VoiceRegistryEntry],
 ) -> Result<TtsSettings, String> {
-    let voice = voice_by_key(voice_key).ok_or_else(|| format!("Unknown voice: {voice_key}"))?;
+    let voice = registry
+        .iter()
+        .find(|voice| voice.key == voice_key)
+        .ok_or_else(|| format!("Unknown voice: {voice_key}"))?;
     if voice.backend != POCKET_BACKEND_ID || !is_locally_available(&voice.availability) {
         return Err("The selected Pocket voice is not available on this device".to_string());
     }
@@ -515,7 +581,7 @@ pub async fn set_pocket_voice(
         .lock()
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))?
         .clone();
-    let settings = settings_with_pocket_voice(settings, &voice_key)?;
+    let settings = settings_with_pocket_voice(settings, &voice_key, &app)?;
     let voice_change = apply_tts_settings(settings, &app, &state).await?;
     drop(transition);
     finish_voice_change(voice_change).await?;
@@ -525,9 +591,11 @@ pub async fn set_pocket_voice(
 #[tauri::command]
 pub async fn preview_pocket_voice(
     voice_key: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let voice = voice_by_key(&voice_key).ok_or_else(|| format!("Unknown voice: {voice_key}"))?;
+    let voice =
+        voice_by_key(&app, &voice_key).ok_or_else(|| format!("Unknown voice: {voice_key}"))?;
     if voice.backend != POCKET_BACKEND_ID {
         return Err("Only Pocket voices can be previewed in this build".to_string());
     }
@@ -540,10 +608,7 @@ pub async fn preview_pocket_voice(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
-    let voice_name = voice
-        .reference_file
-        .and_then(|file| file.strip_suffix(".wav").map(str::to_string))
-        .ok_or_else(|| format!("Voice {voice_key} has no local Pocket reference file"))?;
+    let voice_name = pocket_voice_reference(&app, std::slice::from_ref(&voice_key))?;
     tokio::task::spawn_blocking(move || {
         let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -569,6 +634,69 @@ pub async fn preview_pocket_voice(
     })
     .await
     .map_err(|error| format!("Voice preview task failed: {error}"))?
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TtsVoiceMutation {
+    pub settings: TtsSettings,
+    pub registry: Vec<VoiceRegistryEntry>,
+}
+
+#[tauri::command]
+pub async fn import_pocket_voice(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<TtsVoiceMutation>, String> {
+    let Some(imported) = super::tts_voice_import::pick_and_import(&app).await? else {
+        return Ok(None);
+    };
+    let transition = state.tts_settings_transition.lock().await;
+    let settings = current_settings(&state)?;
+    let settings = settings_with_pocket_voice(settings, &imported.key, &app)?;
+    let voice_change = apply_tts_settings(settings, &app, &state).await?;
+    drop(transition);
+    finish_voice_change(voice_change).await?;
+    Ok(Some(TtsVoiceMutation {
+        settings: current_settings(&state)?,
+        registry: voice_registry(&app),
+    }))
+}
+
+#[tauri::command]
+pub async fn delete_pocket_voice(
+    voice_key: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<TtsVoiceMutation, String> {
+    if !voice_key.starts_with("pocket:imported:") {
+        return Err("Bundled voices cannot be deleted".to_string());
+    }
+    if voice_by_key(&app, &voice_key).is_none() {
+        return Err(format!("Unknown imported voice: {voice_key}"));
+    }
+
+    let transition = state.tts_settings_transition.lock().await;
+    let current = current_settings(&state)?;
+    let selected = resolve_voice_for_backend_in_registry(
+        &current.voice_preferences,
+        POCKET_BACKEND_ID,
+        &voice_registry(&app),
+    )
+    .is_ok_and(|voice| voice.key == voice_key);
+    let voice_change = if selected {
+        let fallback = settings_with_pocket_voice(current, MARY_VOICE_KEY, &app)?;
+        apply_tts_settings(fallback, &app, &state).await?
+    } else {
+        None
+    };
+    drop(transition);
+    finish_voice_change(voice_change).await?;
+    super::tts_voice_import::delete(&app, &voice_key)?;
+    Ok(TtsVoiceMutation {
+        settings: current_settings(&state)?,
+        registry: voice_registry(&app),
+    })
 }
 
 #[cfg(test)]
@@ -633,7 +761,7 @@ mod tests {
     #[test]
     fn v1_registry_has_exactly_the_two_reviewed_bundled_voices() {
         assert_eq!(
-            voice_registry()
+            bundled_voice_registry()
                 .iter()
                 .map(|voice| {
                     (
@@ -684,7 +812,7 @@ mod tests {
     fn identity_is_qualified_key_not_display_label() {
         assert!(is_qualified_voice_key("pocket:imported:audio-content-hash"));
         assert_ne!(MARY_VOICE_KEY, MARIUS_VOICE_KEY);
-        let mut registry = voice_registry();
+        let mut registry = bundled_voice_registry();
         registry[0].display_name = "Jim".to_string();
         registry[1].display_name = "Jim".to_string();
         assert_eq!(registry[0].display_name, registry[1].display_name);
@@ -791,8 +919,12 @@ mod tests {
             voice_preferences: vec!["siri:aaron".to_string(), MARY_VOICE_KEY.to_string()],
             ..TtsSettings::default()
         };
-        let updated =
-            settings_with_pocket_voice(current, MARIUS_VOICE_KEY).expect("available voice");
+        let updated = settings_with_pocket_voice_from_registry(
+            current,
+            MARIUS_VOICE_KEY,
+            &bundled_voice_registry(),
+        )
+        .expect("available voice");
         assert!(!updated.agent_text_to_speech);
         assert_eq!(
             updated.voice_preferences,
@@ -808,8 +940,12 @@ mod tests {
         // This models the next command after the OFF save fails: it must merge
         // from effective memory state, not the stale last-persisted ON value.
         let current = state.tts_settings.lock().expect("settings").clone();
-        let voice_update =
-            settings_with_pocket_voice(current, MARIUS_VOICE_KEY).expect("available voice");
+        let voice_update = settings_with_pocket_voice_from_registry(
+            current,
+            MARIUS_VOICE_KEY,
+            &bundled_voice_registry(),
+        )
+        .expect("available voice");
         assert!(!voice_update.agent_text_to_speech);
     }
 
@@ -822,8 +958,12 @@ mod tests {
             .expect("settings")
             .agent_text_to_speech = false;
         let current = state.tts_settings.lock().expect("settings").clone();
-        let unsaved =
-            settings_with_pocket_voice(current, MARIUS_VOICE_KEY).expect("available voice");
+        let unsaved = settings_with_pocket_voice_from_registry(
+            current,
+            MARIUS_VOICE_KEY,
+            &bundled_voice_registry(),
+        )
+        .expect("available voice");
 
         // This is the only pre-persistence mutation for an OFF candidate.
         commit_effective_off(&state).expect("commit effective OFF state");

@@ -9417,7 +9417,25 @@ export function maybeInstallE2eTauriMocks() {
     deviceId: state === "running" ? "mock-endpoint-id" : null,
     deviceName: state === "running" ? "Mock desktop" : null,
   });
-  const handleMockCommand = async (command: string, payload: unknown) => {
+  let mockImportedVoices: Array<{
+    key: string;
+    displayName: string;
+    backend: string;
+    backendName: string;
+    availability: "installed";
+    fallbackKey: string;
+    referenceFile: string;
+    provenance: {
+      source: string;
+      contentHash: string;
+      license: null;
+      sourceUrl: null;
+    };
+  }> = [];
+  const handleMockCommand = async (
+    command: string,
+    payload: unknown,
+  ): Promise<unknown> => {
     const activeConfig = getConfig();
     const identity = getActiveIdentity(activeConfig);
     window.__BUZZ_E2E_COMMANDS__?.push(command);
@@ -9478,6 +9496,7 @@ export function maybeInstallE2eTauriMocks() {
                 "https://huggingface.co/kyutai/tts-voices/blob/323332d33f997de8394f24a193e1a76df720e01a/voice-donations/Selfie.wav",
             },
           },
+          ...mockImportedVoices,
         ];
       case "set_tts_enabled": {
         const enabled = (payload as { enabled?: boolean })?.enabled;
@@ -9523,6 +9542,69 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "preview_pocket_voice":
         return null;
+      case "import_pocket_voice": {
+        const contentHash = "1".repeat(64);
+        const imported = {
+          key: `pocket:imported:${contentHash}`,
+          displayName: "My voice",
+          backend: "pocket",
+          backendName: "Pocket TTS",
+          availability: "installed" as const,
+          fallbackKey: "pocket:mary",
+          referenceFile: `${contentHash}.wav`,
+          provenance: {
+            source: "local import",
+            contentHash,
+            license: null,
+            sourceUrl: null,
+          },
+        };
+        mockImportedVoices = [imported];
+        const current = activeConfig?.mock?.ttsSettings ?? {
+          version: 1,
+          agentTextToSpeech: true,
+          voicePreferences: ["pocket:mary"],
+        };
+        const settings = {
+          ...current,
+          voicePreferences: [imported.key],
+        };
+        if (activeConfig) {
+          activeConfig.mock ??= {};
+          activeConfig.mock.ttsSettings = settings;
+        }
+        return {
+          settings,
+          registry: await handleMockCommand("list_voice_registry", null),
+        };
+      }
+      case "delete_pocket_voice": {
+        const voiceKey = (payload as { voiceKey?: string })?.voiceKey;
+        if (!voiceKey?.startsWith("pocket:imported:"))
+          throw new Error("Missing imported Pocket voice key");
+        mockImportedVoices = mockImportedVoices.filter(
+          (voice) => voice.key !== voiceKey,
+        );
+        const current = activeConfig?.mock?.ttsSettings ?? {
+          version: 1,
+          agentTextToSpeech: true,
+          voicePreferences: ["pocket:mary"],
+        };
+        const settings = {
+          ...current,
+          voicePreferences: current.voicePreferences.includes(voiceKey)
+            ? ["pocket:mary"]
+            : current.voicePreferences,
+        };
+        if (activeConfig) {
+          activeConfig.mock ??= {};
+          activeConfig.mock.ttsSettings = settings;
+        }
+        return {
+          settings,
+          registry: await handleMockCommand("list_voice_registry", null),
+        };
+      }
       case "get_builderlab_auth":
         return activeConfig?.mock?.builderlabAuth ?? null;
       case "start_builderlab_login": {

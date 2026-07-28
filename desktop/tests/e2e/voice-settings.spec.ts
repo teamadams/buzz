@@ -78,4 +78,43 @@ test.describe("Pocket voice settings", () => {
     await waitForAnimations(page);
     await card.screenshot({ path: SCREENSHOT_PATH });
   });
+
+  test("imports, selects, and safely deletes a local voice", async ({
+    page,
+  }) => {
+    await installMockBridge(page);
+    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await openSettings(page, "voice");
+
+    await page.getByTestId("pocket-voice-import").click();
+    await expect(page.getByTestId("pocket-voice-selector")).toContainText(
+      "My voice",
+    );
+    await expect(page.getByTestId("pocket-voice-delete")).toBeVisible();
+
+    await page.getByTestId("pocket-voice-delete").click();
+    await expect(page.getByText("Delete imported voice?")).toBeVisible();
+    await page.getByTestId("confirm-pocket-voice-delete").click();
+    await expect(page.getByTestId("pocket-voice-selector")).toContainText(
+      "Mary",
+    );
+    await expect(page.getByTestId("pocket-voice-delete")).toBeHidden();
+
+    const mutations = await page.evaluate(() =>
+      (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+        .filter((entry) =>
+          ["import_pocket_voice", "delete_pocket_voice"].includes(
+            entry.command,
+          ),
+        )
+        .map((entry) => ({ command: entry.command, payload: entry.payload })),
+    );
+    expect(mutations).toEqual([
+      { command: "import_pocket_voice", payload: {} },
+      {
+        command: "delete_pocket_voice",
+        payload: { voiceKey: `pocket:imported:${"1".repeat(64)}` },
+      },
+    ]);
+  });
 });

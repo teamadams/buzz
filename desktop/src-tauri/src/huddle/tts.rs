@@ -47,7 +47,7 @@ use std::{
     time::Duration,
 };
 
-use super::pocket::{load_text_to_speech, load_voice_style, SAMPLE_RATE, VOICE_FILE_EXT};
+use super::pocket::{load_text_to_speech, load_voice_style, SAMPLE_RATE};
 use super::preprocessing::{preprocess_for_tts, split_sentences};
 
 #[path = "tts_voice_transition.rs"]
@@ -323,7 +323,7 @@ fn tts_worker(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
-    let voice_path = model_dir.join(format!("{voice_name}.{VOICE_FILE_EXT}"));
+    let voice_path = voice_path(&model_dir, &voice_name);
     let mut style = match load_voice_style(&voice_path) {
         Ok(s) => s,
         Err(e) => {
