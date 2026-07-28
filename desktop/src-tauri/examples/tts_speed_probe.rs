@@ -1,29 +1,41 @@
 use std::time::Instant;
 
+#[path = "../src/huddle/playback_speed_dsp.rs"]
+mod playback_speed_dsp;
+
 const SAMPLE_RATE: u32 = 24_000;
+const SENTENCE_LEAD_IN_SAMPLES: usize = 480;
+const TONE_SECONDS: f64 = 10.0;
 
 fn main() {
-    let input: Vec<f32> = (0..SAMPLE_RATE * 10)
+    let tone: Vec<f32> = (0..SAMPLE_RATE * TONE_SECONDS as u32)
         .map(|index| {
             (2.0 * std::f32::consts::PI * 220.0 * index as f32 / SAMPLE_RATE as f32).sin() * 0.25
         })
         .collect();
+    let mut input = Vec::with_capacity(SENTENCE_LEAD_IN_SAMPLES + tone.len());
+    input.resize(SENTENCE_LEAD_IN_SAMPLES, 0.0);
+    input.extend_from_slice(&tone);
+
+    let compensated_lookahead = playback_speed_dsp::compensated_output_latency_samples(SAMPLE_RATE);
+    let compensated_lookahead_ms = compensated_lookahead as f64 * 1_000.0 / SAMPLE_RATE as f64;
 
     for speed in [0.75_f32, 1.25, 1.5] {
-        let mut processor = ssstretch::Stretch::new();
-        processor.preset_default(1, SAMPLE_RATE as f32);
-        let output_len = (input.len() as f32 / speed).round() as usize;
-        let inputs = [input.clone()];
-        let mut outputs = [Vec::with_capacity(output_len)];
-        let latency_ms = processor.output_latency() as f64 * 1_000.0 / SAMPLE_RATE as f64;
         let started = Instant::now();
-        processor.process_vec(&inputs, input.len() as i32, &mut outputs, output_len as i32);
+        let output = playback_speed_dsp::process_complete_chunk_preserving_lead_in(
+            &input,
+            SENTENCE_LEAD_IN_SAMPLES,
+            speed,
+            SAMPLE_RATE,
+        )
+        .expect("process production-shaped buffer");
         let elapsed = started.elapsed();
         println!(
-            "{speed:.2}x: latency={latency_ms:.1}ms, CPU={:.2}ms for 10s ({:.3}% realtime), output={}",
+            "{speed:.2}x: processing={:.2}ms, {:.3}% realtime, output={} samples, compensated \
+             lookahead={compensated_lookahead_ms:.1}ms",
             elapsed.as_secs_f64() * 1_000.0,
-            elapsed.as_secs_f64() / 10.0 * 100.0,
-            outputs[0].len(),
+            elapsed.as_secs_f64() / TONE_SECONDS * 100.0,
+            output.len(),
         );
     }
 }

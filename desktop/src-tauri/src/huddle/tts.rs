@@ -47,7 +47,7 @@ use std::{
     time::Duration,
 };
 
-use super::playback_speed::{process_complete_chunk, PlaybackSpeedControl};
+use super::playback_speed::{process_complete_chunk_preserving_lead_in, PlaybackSpeedControl};
 use super::pocket::{load_text_to_speech, load_voice_style, SAMPLE_RATE, VOICE_FILE_EXT};
 use super::preprocessing::{preprocess_for_tts, split_sentences};
 
@@ -652,7 +652,12 @@ fn tts_worker(config: TtsWorkerConfig, text_rx: mpsc::Receiver<QueuedText>) {
                     let buf =
                         build_sentence_append_buffer(&mut first_append, audio, silence_buf_len);
                     let speed = playback_speed.get();
-                    let buf = match process_complete_chunk(&buf, speed, SAMPLE_RATE) {
+                    let buf = match process_complete_chunk_preserving_lead_in(
+                        &buf,
+                        SENTENCE_LEAD_IN_SAMPLES,
+                        speed,
+                        SAMPLE_RATE,
+                    ) {
                         Ok(processed) => processed,
                         Err(error) => {
                             eprintln!(
