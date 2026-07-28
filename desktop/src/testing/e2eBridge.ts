@@ -146,6 +146,8 @@ type E2eConfig = {
       agentTextToSpeech: boolean;
       voicePreferences: string[];
     };
+    /** Native picker boundary result for Pocket voice import tests. */
+    pocketVoiceImportResult?: "success" | "cancel" | "invalid";
     /** Advertised HEAD for the first mock project without adding that branch. */
     projectHeadBranch?: string;
     /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
@@ -9543,6 +9545,12 @@ export function maybeInstallE2eTauriMocks() {
       case "preview_pocket_voice":
         return null;
       case "import_pocket_voice": {
+        const importResult =
+          activeConfig?.mock?.pocketVoiceImportResult ?? "success";
+        if (importResult === "cancel") return null;
+        if (importResult === "invalid") {
+          throw new Error("Voice WAV must contain PCM or 32-bit float audio");
+        }
         const contentHash = "1".repeat(64);
         const imported = {
           key: `pocket:imported:${contentHash}`,

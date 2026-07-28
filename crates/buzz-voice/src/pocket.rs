@@ -53,8 +53,14 @@
 //! (`offline-tts-pocket-impl.h` — zero references), and upstream pocket-tts
 //! has no speed parameter either.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use sherpa_onnx::{GenerationConfig, OfflineTts, OfflineTtsConfig, Wave};
 
@@ -205,6 +211,12 @@ pub fn load_voice_style(path: &Path) -> Result<VoiceStyle, String> {
 /// `synth_chunk` on it, never to print it.
 pub struct PocketTts {
     inner: OfflineTts,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SynthesisOutcome {
+    Complete(Vec<f32>),
+    Interrupted,
 }
 
 /// Build the Pocket TTS engine from the model directory installed by
@@ -391,18 +403,42 @@ impl PocketTts {
     pub fn synth_chunk(
         &self,
         text: &str,
+        lang: &str,
+        style: &VoiceStyle,
+        steps: usize,
+    ) -> Result<Vec<f32>, String> {
+        match self.synth_chunk_interruptible(text, lang, style, steps, || false)? {
+            SynthesisOutcome::Complete(samples) => Ok(samples),
+            SynthesisOutcome::Interrupted => Ok(Vec::new()),
+        }
+    }
+
+    /// Synthesise one chunk while allowing the caller to stop in-flight model
+    /// generation. Interrupted output is discarded, so a partial waveform can
+    /// never be queued after a barge-in, voice change, or shutdown.
+    pub fn synth_chunk_interruptible<F>(
+        &self,
+        text: &str,
         _lang: &str,
         style: &VoiceStyle,
         _steps: usize,
-    ) -> Result<Vec<f32>, String> {
+        is_interrupted: F,
+    ) -> Result<SynthesisOutcome, String>
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
         // Mirror upstream pocket-tts prompt prep — without this short or
         // unpunctuated inputs can cause the LM's EOS logit to never trip,
         // producing up to 40 s of "monster breathing" garbage on the first
         // utterance. See `prepare_pocket_prompt` for the full recipe.
         let prepared = match prepare_pocket_prompt(text) {
             Some(p) => p,
-            None => return Ok(Vec::new()),
+            None => return Ok(SynthesisOutcome::Complete(Vec::new())),
         };
+        let is_interrupted = Arc::new(is_interrupted);
+        if is_interrupted() {
+            return Ok(SynthesisOutcome::Interrupted);
+        }
 
         // Per-call generation hints sherpa-onnx forwards to
         // `offline-tts-pocket-impl.h`. We only override `max_frames`, and
@@ -427,9 +463,22 @@ impl PocketTts {
         // whole buffer at once keeps the lookahead pipelining in `tts.rs`
         // simple. `None::<fn(...) -> bool>` pins the callback type for the
         // `generate_with_config` generic parameter.
+        let callback_interrupted = Arc::new(AtomicBool::new(false));
+        let callback_flag = Arc::clone(&callback_interrupted);
+        let callback_predicate = Arc::clone(&is_interrupted);
         let audio = self
             .inner
-            .generate_with_config(&prepared.text, &cfg, None::<fn(&[f32], f32) -> bool>)
+            .generate_with_config(
+                &prepared.text,
+                &cfg,
+                Some(move |_samples: &[f32], _progress: f32| {
+                    let interrupted = callback_predicate();
+                    if interrupted {
+                        callback_flag.store(true, Ordering::Release);
+                    }
+                    !interrupted
+                }),
+            )
             .ok_or_else(|| {
                 format!(
                     "Pocket TTS synthesis failed for text ({} chars)",
@@ -445,7 +494,11 @@ impl PocketTts {
             );
         }
 
-        Ok(audio.samples().to_vec())
+        if callback_interrupted.load(Ordering::Acquire) || is_interrupted() {
+            Ok(SynthesisOutcome::Interrupted)
+        } else {
+            Ok(SynthesisOutcome::Complete(audio.samples().to_vec()))
+        }
     }
 }
 

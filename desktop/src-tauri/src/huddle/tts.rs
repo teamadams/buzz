@@ -47,7 +47,7 @@ use std::{
     time::Duration,
 };
 
-use super::pocket::{load_text_to_speech, load_voice_style, SAMPLE_RATE};
+use super::pocket::{load_text_to_speech, load_voice_style, SynthesisOutcome, SAMPLE_RATE};
 use super::preprocessing::{preprocess_for_tts, split_sentences};
 
 #[path = "tts_voice_transition.rs"]
@@ -622,8 +622,15 @@ fn tts_worker(
                 continue;
             }
 
-            match engine.synth_chunk(text, "en", &style, SYNTH_STEPS) {
-                Ok(samples) if !samples.is_empty() => {
+            let synth_cancel = Arc::clone(&cancel);
+            let synth_voice_cancel = Arc::clone(&voice_cancel);
+            let synth_shutdown = Arc::clone(&shutdown);
+            match engine.synth_chunk_interruptible(text, "en", &style, SYNTH_STEPS, move || {
+                synth_cancel.load(Ordering::Acquire)
+                    || synth_voice_cancel.load(Ordering::Acquire)
+                    || synth_shutdown.load(Ordering::Acquire)
+            }) {
+                Ok(SynthesisOutcome::Complete(samples)) if !samples.is_empty() => {
                     let mut audio = clamp_to_full_scale(samples);
                     // Fade-out only — fading-in would attenuate the consonant
                     // onset (see `apply_fade_out` docstring + the
@@ -664,7 +671,11 @@ fn tts_worker(
                     // See crossfire review C3.
                     tts_active.store(true, Ordering::Release);
                 }
-                Ok(_) => {}
+                Ok(SynthesisOutcome::Complete(_)) => {}
+                Ok(SynthesisOutcome::Interrupted) => {
+                    first_append = true;
+                    break;
+                }
                 Err(e) => {
                     eprintln!("buzz-desktop: TTS synth failed: {e}");
                 }

@@ -826,6 +826,25 @@ pub fn get_model_status(_state: State<'_, AppState>) -> Result<models::VoiceMode
 /// ~2000 chars ≈ 1–2 minutes of speech. Longer messages are truncated.
 const MAX_TTS_TEXT_LEN: usize = 2000;
 
+fn normalize_agent_tts_text(text: String) -> String {
+    if text.chars().count() > MAX_TTS_TEXT_LEN {
+        let mut truncated: String = text.chars().take(MAX_TTS_TEXT_LEN).collect();
+        truncated.push_str("... message truncated.");
+        truncated
+    } else {
+        text
+    }
+}
+
+async fn enqueue_agent_tts_text<F>(text: String, enqueue: F) -> Result<(), String>
+where
+    F: FnOnce(String) -> Result<(), String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || enqueue(text))
+        .await
+        .map_err(|error| format!("TTS enqueue task failed: {error}"))?
+}
+
 /// Called by the WebView when it receives an incoming agent kind:9 message.
 /// Lazily starts the TTS pipeline if models are ready but the pipeline hasn't
 /// been created yet (e.g. models finished downloading after huddle started).
@@ -835,13 +854,7 @@ const MAX_TTS_TEXT_LEN: usize = 2000;
 pub async fn speak_agent_message(text: String, state: State<'_, AppState>) -> Result<(), String> {
     // Truncate oversized messages — agents shouldn't monologue in a voice huddle.
     // Use char count (not byte length) to avoid panicking on multi-byte UTF-8.
-    let text = if text.chars().count() > MAX_TTS_TEXT_LEN {
-        let mut truncated: String = text.chars().take(MAX_TTS_TEXT_LEN).collect();
-        truncated.push_str("... message truncated.");
-        truncated
-    } else {
-        text
-    };
+    let text = normalize_agent_tts_text(text);
 
     let needs_pipeline = {
         let hs = state.huddle()?;
@@ -870,14 +883,16 @@ pub async fn speak_agent_message(text: String, state: State<'_, AppState>) -> Re
     let Some(sender) = sender else {
         return Ok(());
     };
-    tokio::task::spawn_blocking(move || {
+    enqueue_agent_tts_text(text, move |text| {
         sender
             .send(text)
             .map_err(|error| format!("TTS queue closed while waiting to enqueue: {error}"))
     })
     .await
-    .map_err(|error| format!("TTS enqueue task failed: {error}"))?
 }
+
+#[cfg(test)]
+mod agent_tts_routing_tests;
 
 /// Add an agent to the active huddle.
 ///
