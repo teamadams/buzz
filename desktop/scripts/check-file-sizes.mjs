@@ -485,8 +485,8 @@ const overrides = new Map([
   // +4 (1081 -> 1085): mesh recovery keeps one app-scoped state object beside
   // the embedded runtime and coordinator. Probe/re-arm logic lives in
   // mesh_llm/recovery.rs rather than growing AppState or command modules.
-  // +6 (1085 -> 1091): installation-global TTS settings, load diagnostics,
-  // and transition serialization live beside the huddle state they govern.
+  // Installation-global TTS settings, load diagnostics, and transition
+  // serialization live beside the huddle state they govern.
   // Voice behavior remains split across the huddle modules.
   ["src-tauri/src/app_state.rs", 1091],
   // multi-slot splitting + no-op suppression (#1309): the ReadStateManager
