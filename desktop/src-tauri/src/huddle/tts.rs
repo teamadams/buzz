@@ -6,14 +6,12 @@
 //! caller: pipeline.speak("Hello world. How are you?")
 //!   → bounded sync_channel (TEXT_QUEUE_DEPTH = 8)
 //!   → tts_worker thread (owns 1 Pocket TTS engine + 1 persistent Player)
-//!       1. Preprocess text
-//!       2. Split into sentences
-//!       3. Synthesize each sentence individually → f32 PCM
-//!       4. Clamp to full scale + fade out each sentence
-//!       5. Append each buffer to the persistent rodio Player (gapless)
-//!       6. While audio is draining, keep pulling queued text items and
-//!          synthesizing ahead — playback of item N overlaps synthesis of
-//!          item N+1
+//!       1. Preprocess and split text into synthesis chunks.
+//!       2. Copy each independent Pocket decoder callback block.
+//!       3. Clamp and append usable PCM to the persistent Player immediately.
+//!       4. Retain only a short tail so the final fade is applied exactly once.
+//!       5. While queued audio drains, continue synthesis and pull later text
+//!          items so playback of item N overlaps synthesis of item N+1.
 //!   → tts_active = true while audio is queued/playing, false when idle
 //!   → cancel flag: a 10 ms barge-in monitor thread silences the player and
 //!     releases tts_active on the flag's rising edge (~15 ms flag-to-silence,
@@ -49,6 +47,11 @@ use std::{
 
 use super::pocket::{load_text_to_speech, load_voice_style, SAMPLE_RATE, VOICE_FILE_EXT};
 use super::preprocessing::{preprocess_for_tts, split_sentences};
+#[path = "tts_streaming.rs"]
+mod streaming;
+use streaming::PocketStreamAssembler;
+#[cfg(test)]
+use streaming::STREAM_TAIL_SAMPLES;
 
 #[path = "tts_voice_transition.rs"]
 mod voice_transition;
@@ -486,9 +489,9 @@ fn tts_worker(
     // arm or on item receipt before synthesis begins.
     let silence_buf_len = (INTER_SENTENCE_SILENCE * SAMPLE_RATE as f32) as usize;
     // `first_append` = "no audio queued since the player last went idle".
-    // Flipped by `build_sentence_append_buffer` on the first real append; the
-    // idle branch below uses it to decide when to drop `tts_active` and to
-    // arm a fresh lead-in cushion for the next utterance.
+    // Flipped when a callback queues PCM during synthesis or when the retained
+    // final tail is queued; the idle branch below uses it to decide when to
+    // drop `tts_active` and arm a fresh lead-in cushion for the next utterance.
     let mut first_append = true;
     let mut deferred_text = VecDeque::new();
 
@@ -622,47 +625,105 @@ fn tts_worker(
                 continue;
             }
 
-            match engine.synth_chunk(text, "en", &style, SYNTH_STEPS) {
+            let stream = Arc::new(Mutex::new(PocketStreamAssembler::default()));
+            let stream_callback = Arc::clone(&stream);
+            let stream_error = Arc::new(Mutex::new(None::<String>));
+            let stream_error_callback = Arc::clone(&stream_error);
+            let player_callback = Arc::clone(&player);
+            let player_ops_callback = Arc::clone(&player_ops);
+            let cancel_callback = Arc::clone(&cancel);
+            let voice_cancel_callback = Arc::clone(&voice_cancel);
+            let shutdown_callback = Arc::clone(&shutdown);
+            let tts_active_callback = Arc::clone(&tts_active);
+            let callback = move |samples: &[f32], _progress: f32| {
+                if cancel_callback.load(Ordering::Acquire)
+                    || voice_cancel_callback.load(Ordering::Acquire)
+                    || shutdown_callback.load(Ordering::Acquire)
+                {
+                    return false;
+                }
+
+                let result = lock_unpoisoned(&stream_callback).push(samples, |buffer| {
+                    let _ops = lock_player_ops(&player_ops_callback);
+                    if cancel_callback.load(Ordering::Acquire)
+                        || voice_cancel_callback.load(Ordering::Acquire)
+                        || shutdown_callback.load(Ordering::Acquire)
+                    {
+                        return Err("Pocket TTS streaming cancelled".to_string());
+                    }
+                    // Player::append only copies/queues the source. Its mixer
+                    // drains on the audio thread while sherpa-onnx immediately
+                    // continues the next decoder pass.
+                    player_callback.append(SamplesBuffer::new(channels, rate, buffer));
+                    tts_active_callback.store(true, Ordering::Release);
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    *lock_unpoisoned(&stream_error_callback) = Some(error);
+                    return false;
+                }
+                true
+            };
+
+            let synth_result =
+                engine.synth_chunk_streaming(text, "en", &style, SYNTH_STEPS, callback);
+            let callback_error = lock_unpoisoned(&stream_error).take();
+            let queued_during_synthesis = lock_unpoisoned(&stream).queued_samples > 0;
+            if queued_during_synthesis {
+                first_append = false;
+            }
+
+            if let Some(error) = callback_error {
+                if !cancel.load(Ordering::Acquire)
+                    && !voice_cancel.load(Ordering::Acquire)
+                    && !shutdown.load(Ordering::Acquire)
+                {
+                    eprintln!("buzz-desktop: TTS playback queue failed: {error}");
+                }
+                continue;
+            }
+
+            match synth_result {
                 Ok(samples) if !samples.is_empty() => {
-                    let mut audio = clamp_to_full_scale(samples);
-                    // Fade-out only — fading-in would attenuate the consonant
-                    // onset (see `apply_fade_out` docstring + the
-                    // 2026-05-18 "first little sound is missing" regression).
-                    apply_fade_out(&mut audio);
-
-                    // Build one contiguous buffer per synthesized sentence:
-                    // lead-in cushion + audio + trailing gap. Keeping this as
-                    // a single rodio source preserves the original queue/drain
-                    // semantics (one append per sentence) while still giving
-                    // every chunk a quiet device warm-up window.
-                    let buf =
-                        build_sentence_append_buffer(&mut first_append, audio, silence_buf_len);
-
-                    // Check-and-append under `player_ops`, serialized with
-                    // the monitor: a barge-in may have arrived during
-                    // synthesis (the blocking window the monitor thread
-                    // exists for). Don't append the now-stale sentence — the
-                    // human interrupted; speaking it anyway would talk over
-                    // them. Holding the lock for the check + append means the
-                    // monitor can never clear between our check passing and
-                    // the buffer landing. The flag is deliberately NOT
-                    // consumed here: the loop-top handle_cancel_or_shutdown
-                    // does the full consume (drain queue, reset lead-in) on
-                    // the next iteration.
-                    let _ops = lock_player_ops(&player_ops);
-                    if cancel.load(Ordering::Acquire) || voice_cancel.load(Ordering::Acquire) {
-                        // Nothing appended; the loop-top consume re-arms
-                        // `first_append` (the flag is still set — the worker
-                        // is its only consumer).
+                    // The callback can observe cancellation or shutdown while
+                    // generation is blocked. Do not append its retained tail
+                    // afterward.
+                    if cancel.load(Ordering::Acquire)
+                        || voice_cancel.load(Ordering::Acquire)
+                        || shutdown.load(Ordering::Acquire)
+                    {
                         break;
                     }
-                    player.append(SamplesBuffer::new(channels, rate, buf));
-                    // NOTE: tts_active is set AFTER player.append(), not
-                    // before. Setting it before synthesis would cause STT to
-                    // discard user speech during the synthesis window as
-                    // "echo" even though no audio is actually playing yet.
-                    // See crossfire review C3.
-                    tts_active.store(true, Ordering::Release);
+
+                    let finish_result =
+                        lock_unpoisoned(&stream).finish(&samples, silence_buf_len, |buffer| {
+                            // Serialize the final append with the barge-in
+                            // monitor and do not queue stale PCM after either
+                            // cancellation or shutdown.
+                            let _ops = lock_player_ops(&player_ops);
+                            if cancel.load(Ordering::Acquire)
+                                || voice_cancel.load(Ordering::Acquire)
+                                || shutdown.load(Ordering::Acquire)
+                            {
+                                return Err("Pocket TTS streaming cancelled".to_string());
+                            }
+                            player.append(SamplesBuffer::new(channels, rate, buffer));
+                            tts_active.store(true, Ordering::Release);
+                            Ok(())
+                        });
+                    match finish_result {
+                        Ok(()) => first_append = false,
+                        Err(_)
+                            if cancel.load(Ordering::Acquire)
+                                || voice_cancel.load(Ordering::Acquire)
+                                || shutdown.load(Ordering::Acquire) =>
+                        {
+                            break;
+                        }
+                        Err(error) => {
+                            eprintln!("buzz-desktop: TTS playback queue failed: {error}");
+                        }
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -781,7 +842,12 @@ fn handle_cancel_or_shutdown(
 /// is always safe. Without this, a worker panic would wedge the monitor (or
 /// vice versa) on `unwrap()`.
 fn lock_player_ops(ops: &Mutex<()>) -> MutexGuard<'_, ()> {
-    ops.lock().unwrap_or_else(PoisonError::into_inner)
+    lock_unpoisoned(ops)
+}
+
+/// Acquire a mutex while recovering the contained value after a panic.
+fn lock_unpoisoned<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
+    value.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Hard-clamp samples to ±1.0 full scale.
@@ -829,44 +895,6 @@ fn apply_fade_out(samples: &mut [f32]) {
     }
 }
 
-/// Build the single buffer appended to the rodio `Player` for one synthesised
-/// sentence.
-///
-/// Every sentence chunk gets a short lead-in pad immediately before its audio.
-/// This matters for chunks that start with soft first phonemes (`I'm`, `I've`):
-/// the synthesized buffer can begin with speech within the first millisecond,
-/// so the playback layer must provide the device/mixer cushion.
-/// To keep the audible gap unchanged, the trailing silence after this chunk is
-/// shortened by the same amount (`silence_buf_len - SENTENCE_LEAD_IN_SAMPLES`):
-/// sentence N contributes 80 ms of post-speech silence and sentence N+1
-/// contributes the remaining 20 ms of pre-speech cushion.
-///
-/// The lead-in, audio, and trailing silence are concatenated into one
-/// `SamplesBuffer` before appending. This keeps rodio's queue shape at one
-/// tracked source per synthesized sentence, avoiding source-boundary/drain
-/// regressions from enqueueing the lead-in, audio, and tail as separate sounds.
-///
-/// `first_append` is flipped on the first call after the player goes idle.
-/// The worker uses it in the idle branch of the main loop to distinguish
-/// "never queued anything since last drain" from "drained after speaking",
-/// which controls when `tts_active` is released and the lead-in re-armed.
-fn build_sentence_append_buffer(
-    first_append: &mut bool,
-    audio: Vec<f32>,
-    silence_buf_len: usize,
-) -> Vec<f32> {
-    if *first_append {
-        *first_append = false;
-    }
-
-    let trailing_silence_len = silence_buf_len.saturating_sub(SENTENCE_LEAD_IN_SAMPLES);
-    let mut buf = Vec::with_capacity(SENTENCE_LEAD_IN_SAMPLES + audio.len() + trailing_silence_len);
-    buf.extend(std::iter::repeat_n(0.0_f32, SENTENCE_LEAD_IN_SAMPLES));
-    buf.extend(audio);
-    buf.extend(std::iter::repeat_n(0.0_f32, trailing_silence_len));
-    buf
-}
-
 /// Group sentences into synthesis chunks.
 ///
 /// The first sentence always stands alone — it is what the listener hears
@@ -910,6 +938,9 @@ fn group_sentences_into_chunks(sentences: &[String], max_chars: usize) -> Vec<St
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+#[path = "tts_streaming_tests.rs"]
+mod streaming_tests;
 #[cfg(test)]
 #[path = "tts_tests.rs"]
 mod tests;
